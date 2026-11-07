@@ -105,6 +105,26 @@ impl Pmic {
     }
 }
 
+pub const REG_EXT_TEMP: u8 = 0x00;
+pub const REG_TMST_CONFIG: u8 = 0x0c;
+const TMST_READ_THERM: u8 = 0x80;
+const TMST_CONV_END: u8 = 0x20;
+
+/// Fresh panel temperature in °C: start a conversion and wait for it, as the stock papyrus driver's
+/// papyrus_tmst_get_temp does (it runs one every 60 s and the EPDC driver uses the cached value). EXT_TEMP is a
+/// signed byte. Guardrail 5: this is the one PMIC register written besides ENABLE; DVR (VCOM) is never touched.
+pub fn read_temp(p: &Pmic) -> Result<i32, String> {
+    p.write_reg(REG_TMST_CONFIG, TMST_READ_THERM).map_err(|e| format!("TMST_CONFIG write: {e}"))?;
+    for _ in 0..25 {
+        let v = p.read_reg(REG_TMST_CONFIG).map_err(|e| format!("TMST_CONFIG read: {e}"))?;
+        if v & TMST_CONV_END != 0 {
+            return Ok(p.read_reg(REG_EXT_TEMP).map_err(|e| format!("EXT_TEMP read: {e}"))? as i8 as i32);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Err("temperature conversion did not finish in 500 ms".into())
+}
+
 pub fn require_shim() {
     match shim_attr("clocks") {
         Ok(v) if v == "1" => {}

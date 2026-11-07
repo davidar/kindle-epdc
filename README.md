@@ -22,8 +22,8 @@ with its source; [docs/kernel-tree.md](docs/kernel-tree.md) explains how the shi
 | 3.5 | `.wbf` to `.wrf` waveform converter, byte-identical to Amazon's tool, every checksum verified | done |
 | 4 | An image: 8-bit PGM through a full-screen GC16 update, greys and orientation correct, INIT first | done |
 | 5 | Partial updates: a rectangle rather than the whole screen (region-sized buffer, 8-pixel alignment, panel coordinates); waveform chosen per region from its histogram as the stock driver does (DU for black and white, GL16 for greys) | done |
-| 6 | Concurrent updates: LUT collision handling and resubmission, fresh temperature conversions | next |
-| 7 | Unattended operation: idle power and clock gating behind the clock-state invariant, suspend coordination | |
+| 6 | Concurrent updates: submit as soon as the working buffer is free, one LUT per update, collisions held and resubmitted, a fresh PMIC temperature conversion per run | done |
+| 7 | Unattended operation: idle power and clock gating behind the clock-state invariant, suspend coordination | next |
 
 ## Why
 
@@ -49,9 +49,9 @@ metal, and the out-of-tree i.MX6 EPDC DRM driver.
   sequence; `wbf.rs` the `.wbf` → `.wrf` waveform converter, with tests; `display.rs` controller init, the golden
   check and updates; `main.rs` the command line.
 - `scripts/`: `hold.sh` and `release.sh` keep the Kindle from suspending during a session; `m1-probe.sh`,
-  `m2-rails.sh`, `m3-init-white.sh`, `m4-image.sh`, `m5-blit.sh` are the milestone runs, each of which swaps the
-  stock driver out, runs one step, and restores stock through the boot job. `render-text.py` renders a line of
-  text as a region PGM in panel orientation for `epdc blit`.
+  `m2-rails.sh`, `m3-init-white.sh`, `m4-image.sh`, `m5-blit.sh`, `m6-pipeline.sh` are the milestone runs, each
+  of which swaps the stock driver out, runs one step, and restores stock through the boot job. `render-text.py`
+  renders a line of text as a region PGM in panel orientation for `epdc blit`, whole or one word per file.
 - `epdc-regs-stock.bin`: the EPDC register window as Amazon's driver leaves it, the reference every init is
   compared against.
 
@@ -68,9 +68,10 @@ epdc wbf <in.wbf> [out.wrf]     convert a waveform and print its header
 epdc white [--check] [wbf]      controller init + golden check (+ one full-screen INIT update unless --check)
 epdc show <image.pgm> [mode] [wbf] [--no-init]   draw an 800x600 8-bit PGM with one full-screen update
                                 (mode: 0 INIT, 1 DU, 2 GC16, 4 A2, 5 GL16)
-epdc blit [--no-init] [--wbf path] <pgm>@<x>,<y>[:<mode>|:auto][:full|partial] ...
-                                rectangle updates in sequence, each PGM's size the rectangle, placed at (x, y) in
-                                panel coordinates (all multiples of 8); mode defaults to auto; each LUT is timed
+epdc blit [--no-init] [--serial] [--wbf path] <pgm>@<x>,<y>[:<mode>|:auto][:full|partial][+<ms>] ...
+                                rectangle updates, each PGM's size the rectangle, placed at (x, y) in panel
+                                coordinates (all multiples of 8); mode defaults to auto; +<ms> waits after the
+                                previous submit. Pipelined unless --serial; every LUT is timed
 ```
 
 Everything but `wbf` needs the shim loaded. `white` refuses to power the panel unless the parsed waveform matches a
@@ -82,6 +83,15 @@ update then skips every glyph pixel as unchanged. The region buffer has no strid
 row by row, as the stock driver's PxP output is. `auto` counts the grey levels in the region and picks DU when
 only black and white are present and GL16 otherwise, the stock driver's histogram rule; antialiased text through
 DU comes out ragged.
+
+Updates overlap in time. Each occupies one of the 16 LUTs for the length of its waveform and the timing
+controller drives every active LUT on every frame, so the only serial part is the working-buffer stage, where the
+EPDC merges the region into the working buffer (0.4 to 11 ms here) and detects collisions. The driver submits as
+soon as that stage is free; an update whose rectangle touches pixels another LUT is still driving is reported
+as a collision (not applied), held until those LUTs finish, and resubmitted. A collided LUT shows as active
+until it clears. Measured: four strips submitted within 35 ms finish together in one GL16 time (612 ms) instead
+of 1.7 s serial; words submitted every 150 ms each finish 250 to 260 ms after their own submit. Temperature is a
+fresh PMIC conversion at bring-up and again when the last one is over 30 s old (stock reconverts every 60 s).
 
 ## Building
 

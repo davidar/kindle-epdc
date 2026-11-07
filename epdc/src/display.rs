@@ -120,7 +120,26 @@ pub struct Panel {
     pub m_wb: uio::Map,
     pub m_upd: uio::Map,
     pub p: pmic::Pmic,
-    pub tidx: u32,
+    pub trt: Vec<u8>,
+    pub tidx: std::cell::Cell<u32>,
+    pub temp_at: std::cell::Cell<std::time::Instant>,
+}
+
+/// How long a temperature conversion stays good for; the stock papyrus driver refreshes every 60 s.
+pub const TEMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl Panel {
+    /// The temperature index for the next update, reconverted when the last reading is older than TEMP_MAX_AGE.
+    pub fn temp_index(&self) -> u32 {
+        if self.temp_at.get().elapsed() > TEMP_MAX_AGE {
+            match pmic::read_temp(&self.p) {
+                Ok(t) => { let i = temp_index(&self.trt, t); println!("temperature {} C -> index {} (reconverted)", t, i); self.tidx.set(i); }
+                Err(e) => eprintln!("temperature: {e}; keeping index {}", self.tidx.get()),
+            }
+            self.temp_at.set(std::time::Instant::now());
+        }
+        self.tidx.get()
+    }
 }
 
 /// Everything up to and including the golden check: waveform into DMA, working buffer zeroed, EPDC programmed
@@ -151,9 +170,9 @@ pub fn bring_up(wf_path: Option<&str>) -> Panel {
     if back != wf.data[..8] || tail != wf.data[wf.data.len() - 8..] { eprintln!("DMA copy mismatch"); std::process::exit(7); }
 
     let p = pmic::Pmic::open().expect("i2c");
-    let temp_c = p.read_reg(0x00).expect("EXT_TEMP") as i32;
+    let temp_c = match pmic::read_temp(&p) { Ok(t) => t, Err(e) => { eprintln!("{e}"); std::process::exit(7); } };
     let tidx = temp_index(&wf.trt, temp_c);
-    println!("panel temperature {} C -> temp index {}", temp_c, tidx);
+    println!("panel temperature {} C (fresh conversion) -> temp index {}", temp_c, tidx);
 
     println!("== init_settings");
     init_settings(&r, tidx);
@@ -162,7 +181,7 @@ pub fn bring_up(wf_path: Option<&str>) -> Panel {
     println!("WVADDR {:#010x} WB_ADDR {:#010x} TEMP {} CTRL {:#010x}", r.read32(regs::WVADDR), r.read32(regs::WB_ADDR), r.read32(regs::TEMP), r.read32(regs::CTRL));
     println!("== golden check");
     if !check_golden(&r) { eprintln!("register mismatch against the stock snapshot: refusing to power the panel"); std::process::exit(8); }
-    Panel { u, r, m_wf, m_wb, m_upd, p, tidx }
+    Panel { u, r, m_wf, m_wb, m_upd, p, trt: wf.trt.clone(), tidx: std::cell::Cell::new(tidx), temp_at: std::cell::Cell::new(std::time::Instant::now()) }
 }
 
 fn install_panic_hook() {
@@ -214,7 +233,7 @@ pub fn update_rect(pn: &Panel, buf_phys: u32, rect: Rect, wfm_mode: u32, full: b
     r.write32(regs::UPD_ADDR, buf_phys);
     r.write32(regs::UPD_CORD, (rect.y << regs::UPD_CORD_YCORD_OFFSET) | rect.x);
     r.write32(regs::UPD_SIZE, (rect.h << regs::UPD_SIZE_HEIGHT_OFFSET) | rect.w);
-    r.write32(regs::TEMP, pn.tidx);
+    r.write32(regs::TEMP, pn.temp_index());
     let mut ctrl = (lut << regs::UPD_CTRL_LUT_SEL_OFFSET) | (wfm_mode << regs::UPD_CTRL_WAVEFORM_MODE_OFFSET);
     if full { ctrl |= regs::UPD_CTRL_UPDATE_MODE_FULL; }
     match fixed_np {
@@ -322,9 +341,103 @@ pub fn show(image: &str, mode: u32, wf_path: Option<&str>, init_first: bool) {
     pmic::rails_down(&pn.p);
 }
 
+/// Program and start one update, then wait for the working-buffer stage only (WB_CMPLT), which is where the
+/// EPDC merges the region into the working buffer and detects collisions. Returns the LUT it runs on, or the
+/// mask of LUTs it collided with (the update was not applied and must be resubmitted once they finish), or an
+/// error string. Milestone 6: this is what lets updates overlap in time; `update_rect` waits for the whole LUT.
+pub fn submit(pn: &Panel, buf_phys: u32, rect: Rect, wfm_mode: u32, full: bool) -> Result<u32, Result<u32, String>> {
+    let r = &pn.r;
+    rect.check().map_err(Err)?;
+    let t0 = std::time::Instant::now();
+    let lut = loop {
+        let nl = r.read32(regs::STATUS_NEXTLUT);
+        if nl & regs::STATUS_NEXTLUT_NEXT_LUT_VALID != 0 { break nl & regs::STATUS_NEXTLUT_NEXT_LUT_MASK; }
+        if t0.elapsed().as_millis() > 3000 { return Err(Err(format!("no LUT free after 3 s (STATUS_LUTS {:#06x})", r.read32(regs::STATUS_LUTS)))); }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    while r.read32(regs::STATUS) & regs::STATUS_WB_BUSY != 0 {
+        if t0.elapsed().as_millis() > 3000 { return Err(Err("working buffer busy for 3 s".into())); }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    r.write32(regs::IRQ_CLEAR, regs::IRQ_WB_CMPLT | regs::IRQ_LUT_COL);
+    r.write32(regs::UPD_ADDR, buf_phys);
+    r.write32(regs::UPD_CORD, (rect.y << regs::UPD_CORD_YCORD_OFFSET) | rect.x);
+    r.write32(regs::UPD_SIZE, (rect.h << regs::UPD_SIZE_HEIGHT_OFFSET) | rect.w);
+    r.write32(regs::TEMP, pn.temp_index());
+    r.write32(regs::UPD_FIXED, 0);
+    let mut ctrl = (lut << regs::UPD_CTRL_LUT_SEL_OFFSET) | (wfm_mode << regs::UPD_CTRL_WAVEFORM_MODE_OFFSET);
+    if full { ctrl |= regs::UPD_CTRL_UPDATE_MODE_FULL; }
+    r.write32(regs::UPD_CTRL, ctrl);
+    let t1 = std::time::Instant::now();
+    loop {
+        let irq = r.read32(regs::IRQ);
+        if irq & regs::IRQ_WB_CMPLT != 0 {
+            let col = r.read32(regs::STATUS_COL);
+            let collided = irq & regs::IRQ_LUT_COL != 0;
+            r.write32(regs::IRQ_CLEAR, regs::IRQ_WB_CMPLT | regs::IRQ_LUT_COL);
+            let luts = r.read32(regs::STATUS_LUTS);
+            println!("  submit {:?} mode {} {} -> LUT {}: WB done in {:?}{}; STATUS_LUTS {:#06x}", rect, wfm_mode,
+                if full { "FULL" } else { "PARTIAL" }, lut, t1.elapsed(),
+                if collided { format!(", COLLISION with LUTs {:#06x}", col) } else { String::new() }, luts);
+            if collided { return Err(Ok(col)); }
+            return Ok(lut);
+        }
+        if t1.elapsed().as_millis() > 1000 { return Err(Err(format!("no WB_CMPLT after 1 s (IRQ {:#010x} STATUS {:#x})", irq, r.read32(regs::STATUS)))); }
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+}
+
+/// Per-op record of a pipelined run, times relative to the batch start.
+#[derive(Clone, Debug)]
+pub struct OpResult { pub mode: u32, pub lut: Option<u32>, pub submitted_ms: u128, pub done_ms: Option<u128>, pub collisions: u32 }
+
+/// Run `ops` with updates overlapping in time: each is submitted as soon as its delay has passed and the working
+/// buffer is free, without waiting for earlier LUTs. A collision holds the op until the LUTs it hit have
+/// finished, then resubmits it (stock does the same, except that it drops an update colliding with a newer one;
+/// ours are in order, so the colliding op is always the newer one). Completion is read from STATUS_LUTS.
+pub fn run_ops(pn: &Panel, ops: &[BlitOp], loaded: &[(Rect, Vec<u8>, usize)]) -> Vec<OpResult> {
+    let r = &pn.r;
+    let t0 = std::time::Instant::now();
+    let ms = |t: std::time::Instant| t.duration_since(t0).as_millis();
+    let mut results: Vec<OpResult> = Vec::new();
+    let mut active: Vec<(u32, usize)> = Vec::new(); // (lut, op index)
+    let harvest = |active: &mut Vec<(u32, usize)>, results: &mut Vec<OpResult>| {
+        let luts = r.read32(regs::STATUS_LUTS);
+        active.retain(|&(lut, i)| {
+            if luts & (1 << lut) == 0 { results[i].done_ms = Some(ms(std::time::Instant::now())); println!("  LUT {} done at t+{} ms ({})", lut, results[i].done_ms.unwrap(), ops[i].pgm); false } else { true }
+        });
+    };
+    let mut last_submit = t0;
+    for (i, (op, (rect, px, off))) in ops.iter().zip(loaded).enumerate() {
+        let mode = match op.mode { Some(m) => m, None => auto_mode(px).0 };
+        results.push(OpResult { mode, lut: None, submitted_ms: 0, done_ms: None, collisions: 0 });
+        while last_submit.elapsed().as_millis() < op.delay_ms as u128 { harvest(&mut active, &mut results); std::thread::sleep(std::time::Duration::from_millis(1)); }
+        loop {
+            harvest(&mut active, &mut results);
+            let t = std::time::Instant::now();
+            match submit(pn, pn.m_upd.phys as u32 + *off as u32, *rect, mode, op.full) {
+                Ok(lut) => { results[i].lut = Some(lut); results[i].submitted_ms = ms(t); active.push((lut, i)); last_submit = t; break; }
+                Err(Ok(mask)) => {
+                    results[i].collisions += 1;
+                    if results[i].collisions > 8 { eprintln!("{}: still colliding after 8 tries, giving up", op.pgm); break; }
+                    let tw = std::time::Instant::now();
+                    while r.read32(regs::STATUS_LUTS) & mask != 0 && tw.elapsed().as_millis() < 3000 { harvest(&mut active, &mut results); std::thread::sleep(std::time::Duration::from_millis(1)); }
+                    println!("  colliding LUTs {:#06x} clear after {:?}; resubmitting {}", mask, tw.elapsed(), op.pgm);
+                }
+                Err(Err(e)) => { eprintln!("{}: {e}", op.pgm); break; }
+            }
+        }
+    }
+    let tw = std::time::Instant::now();
+    while !active.is_empty() && tw.elapsed().as_millis() < 10000 { harvest(&mut active, &mut results); std::thread::sleep(std::time::Duration::from_millis(1)); }
+    for &(lut, i) in &active { eprintln!("LUT {} ({}) still active after 10 s", lut, ops[i].pgm); }
+    println!("batch complete at t+{} ms", ms(std::time::Instant::now()));
+    results
+}
+
 /// One step of `epdc blit`: a PGM whose size is the rectangle, placed at (x, y) in panel coordinates.
 #[derive(Clone, Debug)]
-pub struct BlitOp { pub pgm: String, pub x: u32, pub y: u32, pub mode: Option<u32>, pub full: bool }
+pub struct BlitOp { pub pgm: String, pub x: u32, pub y: u32, pub mode: Option<u32>, pub full: bool, pub delay_ms: u32 }
 
 /// What the stock driver's WAVEFORM_MODE_AUTO does with the PxP histogram of the region: only black and white
 /// present -> the two-level DU; any other grey -> GL16 (the framework's page-turn choice; GC16 is the periodic
@@ -337,10 +450,11 @@ pub fn auto_mode(px: &[u8]) -> (u32, usize) {
     (if bw_only { regs::WFM_DU } else { regs::WFM_GL16 }, levels)
 }
 
-/// `epdc blit [--no-init] [--wbf path] <pgm>@<x>,<y>[:<mode>|:auto][:full|partial] ...`: bring up, rails up,
-/// take over (unless --no-init), then each rectangle update in turn, from a region-sized buffer at the next 4 KiB slot
-/// of map3, timing each LUT. Milestone 5: partial updates, the thing a text display is built from.
-pub fn blit(ops: &[BlitOp], wf_path: Option<&str>, init_first: bool) {
+/// `epdc blit [--no-init] [--serial] [--wbf path] <pgm>@<x>,<y>[:<mode>|:auto][:full|partial][+<ms>] ...`: bring
+/// up, rails up, take over (unless --no-init), then the rectangle updates, each from a region-sized buffer in
+/// its own 4 KiB slot of map3. Pipelined by default (milestone 6: submitted as soon as the working buffer is
+/// free, `+<ms>` delaying a submit after the previous one); `--serial` waits for each LUT (milestone 5).
+pub fn blit(ops: &[BlitOp], wf_path: Option<&str>, init_first: bool, serial: bool) {
     // Validate everything before the panel is touched: every PGM readable, every rectangle legal.
     let mut loaded = Vec::new();
     for op in ops {
@@ -354,30 +468,40 @@ pub fn blit(ops: &[BlitOp], wf_path: Option<&str>, init_first: bool) {
     println!("== rails up");
     if let Err(e) = pmic::rails_up(&pn.p) { eprintln!("rails: {e}"); std::process::exit(9); }
     if init_first { take_over(&pn); }
-    let mut results = Vec::new();
-    // Region buffers go in successive 4 KiB-aligned slots after the full-screen white buffer, wrapping when the
-    // map is used up: a buffer is never rewritten right after its update, even though update_rect waits for
-    // each LUT before returning.
+    // Region buffers go in successive 4 KiB-aligned slots after the full-screen white buffer, all loaded before
+    // the first submit so a pipelined run is not paced by the copies.
     let mut next_off = WHITE_END;
-    for (op, (rect, px)) in ops.iter().zip(&loaded) {
-        if next_off + px.len() > pn.m_upd.len { next_off = WHITE_END; }
-        let off = next_off;
-        next_off += (px.len() + 4095) & !4095;
-        if let Err(e) = load_into(&pn.m_upd, off, px, &op.pgm) { eprintln!("{e}"); break; }
-        let mode = match op.mode {
-            Some(m) => m,
-            None => { let (m, levels) = auto_mode(px); println!("auto: {} grey levels in the region -> waveform mode {}", levels, m); m }
-        };
-        println!("== blit {} -> {:?} mode {} {}", op.pgm, rect, mode, if op.full { "FULL" } else { "PARTIAL" });
-        let took = update_rect(&pn, pn.m_upd.phys as u32 + off as u32, *rect, mode, op.full, None, 8000);
-        results.push((op.clone(), *rect, mode, took));
-        if took.is_none() { eprintln!("update did not complete; stopping the sequence"); break; }
+    let mut placed: Vec<(Rect, Vec<u8>, usize)> = Vec::new();
+    for (op, (rect, px)) in ops.iter().zip(loaded) {
+        if next_off + px.len() > pn.m_upd.len { eprintln!("update map full after {} regions", placed.len()); pmic::rails_down(&pn.p); std::process::exit(10); }
+        if let Err(e) = load_into(&pn.m_upd, next_off, &px, &op.pgm) { eprintln!("{e}"); pmic::rails_down(&pn.p); std::process::exit(10); }
+        placed.push((rect, px, next_off));
+        next_off += (placed.last().unwrap().1.len() + 4095) & !4095;
     }
+    let results: Vec<OpResult> = if serial {
+        let t0 = std::time::Instant::now();
+        let mut v = Vec::new();
+        for (op, (rect, px, off)) in ops.iter().zip(&placed) {
+            let mode = match op.mode { Some(m) => m, None => { let (m, levels) = auto_mode(px); println!("auto: {} grey levels -> mode {}", levels, m); m } };
+            println!("== blit {} -> {:?} mode {} {}", op.pgm, rect, mode, if op.full { "FULL" } else { "PARTIAL" });
+            let sub = t0.elapsed().as_millis();
+            let took = update_rect(&pn, pn.m_upd.phys as u32 + *off as u32, *rect, mode, op.full, None, 8000);
+            v.push(OpResult { mode, lut: None, submitted_ms: sub, done_ms: took.map(|_| t0.elapsed().as_millis()), collisions: 0 });
+            if took.is_none() { eprintln!("update did not complete; stopping the sequence"); break; }
+        }
+        v
+    } else {
+        println!("== pipelined run of {} updates", ops.len());
+        run_ops(&pn, ops, &placed)
+    };
     println!("== rails down");
     pmic::rails_down(&pn.p);
-    println!("== summary");
-    for (op, rect, mode, took) in &results {
-        println!("  {:<40} {:>3},{:>3} {:>3}x{:>3} mode {}{} {:<7} {}", op.pgm, rect.x, rect.y, rect.w, rect.h, mode, if op.mode.is_none() { " (auto)" } else { "" },
-            if op.full { "FULL" } else { "PARTIAL" }, took.map(|d| format!("{} ms", d.as_millis())).unwrap_or("TIMEOUT".into()));
+    println!("== summary (ms from batch start: submitted -> LUT done; duration)");
+    for (op, (rect, _, _), res) in ops.iter().zip(&placed).zip(&results).map(|((a, b), c)| (a, b, c)) {
+        println!("  {:<28} {:>3},{:>3} {:>3}x{:>3} mode {}{} {:<7} {:>5} -> {:>5}  {:>4}{}", op.pgm.rsplit('/').next().unwrap_or(&op.pgm),
+            rect.x, rect.y, rect.w, rect.h, res.mode, if op.mode.is_none() { "a" } else { " " }, if op.full { "FULL" } else { "PARTIAL" },
+            res.submitted_ms, res.done_ms.map(|d| d.to_string()).unwrap_or("-".into()),
+            res.done_ms.map(|d| format!("{} ms", d - res.submitted_ms)).unwrap_or("TIMEOUT".into()),
+            if res.collisions > 0 { format!("  {} collision(s)", res.collisions) } else { String::new() });
     }
 }

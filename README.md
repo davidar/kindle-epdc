@@ -68,12 +68,24 @@ KINDLE_KERNEL_TREE=/path/to/tree shim/build.sh                              # th
 Rust's musl target links with `rust-lld` and `crt-static` (see `epdc/.cargo/config.toml`), which is what lets a
 2026 toolchain produce a binary for a 2009 kernel.
 
+## Getting your panel's waveform
+
+The waveform is specific to the panel in front of you and is not in this repository. The Kindle's boot job reads it
+from the panel's flash and leaves it in `/var/local/eink/panel/` as `<name>.wbf`, with Amazon's conversion beside
+it as `<name>.wrf`. `scripts/fetch-panel.sh` copies both (plus `panel_id`) into `panel/`, generating the `.wrf` on
+the device with Amazon's own tool first if it is missing. `epdc wbf panel/<name>.wbf` then shows the header and
+proves the converter reproduces the `.wrf`; the milestone scripts upload whatever is in `panel/`.
+
+`epdc-regs-stock.bin` was taken from one Kindle Touch; the values are the board file's constants, so another Touch
+should match, and `epdc snapshot` regenerates it from the stock driver's state if yours differs.
+
 ## Running a session
 
 The milestone scripts assume an ssh alias for the Kindle (`KINDLE_HOST`, default `kindle`) with root, usbnet or
 wifi. The device must be jailbroken for ssh; nothing else is changed on it.
 
-1. `scripts/hold.sh`: stops `powerd` and guards `/sys/power/state`, so the device stays up.
+1. `scripts/fetch-panel.sh` once, then `scripts/hold.sh`: stops `powerd` and guards `/sys/power/state`, so the
+   device stays up.
 2. `scripts/m3-init-white.sh` (or `CHECK=1 scripts/m3-init-white.sh` for the dry run), or
    `scripts/m4-image.sh [image.pgm] [mode]` for an image: stops the UI jobs, unloads `mxc_epdc_fb`, loads the shim,
    runs the driver, powers down, reloads stock through `/etc/upstart/display`. `images/milestone4-800x600.pgm` is

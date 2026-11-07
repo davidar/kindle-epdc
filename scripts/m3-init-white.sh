@@ -10,8 +10,10 @@ exec > >(tee "$log") 2>&1
 echo "m3 start $(date +%T) CHECK=${CHECK:-0}"
 ssh -o ConnectTimeout=8 $H 'mount | grep -q " /sys/power/state " && /sbin/initctl list | grep -q "powerd stop/waiting" && echo "hold ok" || { echo "NOT HELD: run scripts/hold.sh first (suspend guard + powerd stopped)"; exit 1; }' || exit 1
 scp -O -q shim/epdc_uio.ko epdc/target/armv7-unknown-linux-musleabihf/release/epdc $H:/mnt/us/kindle-epdc/ || { echo "scp failed"; exit 1; }
-scp -O -q panel/06_05_007a_3c_158e21_03_3c_00000986_85_04.wbf $H:/mnt/us/kindle-epdc/panel.wbf || { echo "scp wbf failed"; exit 1; }
-scp -O -q panel/06_05_007a_3c_158e21_03_3c_00000986_85_04.wrf $H:/mnt/us/kindle-epdc/panel.wrf || { echo "scp wrf failed"; exit 1; }
+WBF=$(/bin/ls panel/*.wbf 2>/dev/null | head -1); WRF=${WBF%.wbf}.wrf
+[ -n "$WBF" ] || { echo "no panel/*.wbf: run scripts/fetch-panel.sh first"; exit 1; }
+scp -O -q "$WBF" $H:/mnt/us/kindle-epdc/panel.wbf || { echo "scp wbf failed"; exit 1; }
+[ -f "$WRF" ] && { scp -O -q "$WRF" $H:/mnt/us/kindle-epdc/panel.wrf || { echo "scp wrf failed"; exit 1; }; }
 ssh -o ConnectTimeout=8 $H '
 export PATH=/usr/sbin:/usr/bin:/bin:/sbin
 chmod 755 /mnt/us/kindle-epdc/epdc; md5sum /mnt/us/kindle-epdc/epdc /mnt/us/kindle-epdc/epdc_uio.ko /mnt/us/kindle-epdc/panel.wbf /mnt/us/kindle-epdc/panel.wrf | cut -c1-8

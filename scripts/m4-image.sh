@@ -13,6 +13,10 @@ exec > >(tee "$log") 2>&1
 echo "m4 start $(date +%T) image=$IMG mode=$MODE"
 ssh -o ConnectTimeout=8 $H 'mount | grep -q " /sys/power/state " && /sbin/initctl list | grep -q "powerd stop/waiting" && echo "hold ok" || { echo "NOT HELD: run scripts/hold.sh first (suspend guard + powerd stopped)"; exit 1; }' || exit 1
 scp -O -q shim/epdc_uio.ko epdc/target/armv7-unknown-linux-musleabihf/release/epdc $H:/mnt/us/kindle-epdc/ || { echo "scp failed"; exit 1; }
+WBF=$(/bin/ls panel/*.wbf 2>/dev/null | head -1); WRF=${WBF%.wbf}.wrf
+[ -n "$WBF" ] || { echo "no panel/*.wbf: run scripts/fetch-panel.sh first"; exit 1; }
+scp -O -q "$WBF" $H:/mnt/us/kindle-epdc/panel.wbf || { echo "scp wbf failed"; exit 1; }
+[ -f "$WRF" ] && { scp -O -q "$WRF" $H:/mnt/us/kindle-epdc/panel.wrf || { echo "scp wrf failed"; exit 1; }; }
 scp -O -q "$IMG" $H:/mnt/us/kindle-epdc/image.pgm || { echo "scp image failed"; exit 1; }
 ssh -o ConnectTimeout=8 $H '
 export PATH=/usr/sbin:/usr/bin:/bin:/sbin

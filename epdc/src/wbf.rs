@@ -173,12 +173,13 @@ pub fn convert(d: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    const WBF: &str = "../panel/06_05_007a_3c_158e21_03_3c_00000986_85_04.wbf";
+    const WBF: &str = "../panel/06_05_007a_3c_158e21_03_3c_00000986_85_04.wbf"; // the author's unit; see fetch-panel.sh
     const WRF: &str = "../panel/06_05_007a_3c_158e21_03_3c_00000986_85_04.wrf";
 
+    // Both tests need the panel files fetched into ../panel/ (scripts/fetch-panel.sh); they skip otherwise.
     #[test]
     fn header_reads_this_panel() {
-        let d = std::fs::read(WBF).unwrap();
+        let Ok(d) = std::fs::read(WBF) else { eprintln!("skipped: {WBF} not present"); return };
         let h = parse_header(&d).unwrap();
         assert_eq!(h.filesize as usize, d.len());
         assert_eq!(h.mode_version, 4);
@@ -192,8 +193,7 @@ mod tests {
 
     #[test]
     fn wrf_matches_kindle() {
-        let d = std::fs::read(WBF).unwrap();
-        let want = std::fs::read(WRF).unwrap();
+        let (Ok(d), Ok(want)) = (std::fs::read(WBF), std::fs::read(WRF)) else { eprintln!("skipped: panel files not present"); return };
         let got = convert(&d).unwrap();
         assert_eq!(got.len(), want.len(), "length differs");
         if got != want {

@@ -33,6 +33,21 @@ fn main() {
             let mode: u32 = pos.get(1).and_then(|m| m.parse().ok()).unwrap_or(regs::WFM_GC16);
             display::show(image, mode, pos.get(2).map(|s| s.as_str()), !no_init)
         }
+        Some("blit") => {
+            // epdc blit [--no-init] [--wbf path] <pgm>@<x>,<y>[:<mode>|:auto][:full|partial] ...
+            let no_init = args.iter().any(|a| a == "--no-init");
+            let wbf = args.iter().position(|a| a == "--wbf").and_then(|i| args.get(i + 1)).map(String::as_str);
+            let mut ops = Vec::new();
+            let mut skip = false;
+            for a in args.iter().skip(2) {
+                if skip { skip = false; continue; }
+                if a == "--wbf" { skip = true; continue; }
+                if a.starts_with("--") { continue; }
+                match parse_blit(a) { Some(op) => ops.push(op), None => { eprintln!("bad blit op {a:?}: want <pgm>@<x>,<y>[:<mode>|:auto][:full|partial]"); std::process::exit(2); } }
+            }
+            if ops.is_empty() { eprintln!("usage: epdc blit [--no-init] [--wbf path] <pgm>@<x>,<y>[:<mode>|:auto][:full|partial] ..."); std::process::exit(2); }
+            display::blit(&ops, wbf, !no_init)
+        }
         Some("pmic") => match args.get(2).map(String::as_str) {
             None | Some("dump") => pmic::dump(),
             Some("up") => pmic::up(args.get(3).map(String::as_str)),
@@ -40,7 +55,7 @@ fn main() {
             _ => { eprintln!("usage: epdc pmic [dump|up [ms|stay]|down]"); std::process::exit(2); }
         },
         _ => {
-            eprintln!("usage: epdc probe | snapshot [outfile] | pmic [dump|up|down] | white [--check] [wrf]");
+            eprintln!("usage: epdc probe | snapshot [outfile] | pmic [dump|up|down] | white [--check] [wbf] | wbf <in> [out] | show <pgm> [mode] [wbf] [--no-init] | blit [--no-init] [--wbf path] <pgm>@<x>,<y>[:<mode>|:auto][:full|partial] ...");
             std::process::exit(2);
         }
     }
@@ -88,4 +103,22 @@ fn snapshot(out: Option<&str>) {
         std::fs::write(path, &raw).expect("write snapshot");
         println!("wrote {} ({} bytes)", path, raw.len());
     }
+}
+
+/// `<pgm>@<x>,<y>[:<mode>|:auto][:full|partial]`; mode defaults to auto (DU for black-and-white regions, GL16
+/// otherwise, as the stock driver chooses from its histogram), update mode to FULL.
+fn parse_blit(a: &str) -> Option<display::BlitOp> {
+    let (pgm, rest) = a.rsplit_once('@')?;
+    let mut parts = rest.split(':');
+    let (x, y) = parts.next()?.split_once(',')?;
+    let mut op = display::BlitOp { pgm: pgm.to_string(), x: x.parse().ok()?, y: y.parse().ok()?, mode: None, full: true };
+    for p in parts {
+        match p {
+            "full" => op.full = true,
+            "partial" => op.full = false,
+            "auto" => op.mode = None,
+            m => op.mode = Some(m.parse().ok()?),
+        }
+    }
+    Some(op)
 }

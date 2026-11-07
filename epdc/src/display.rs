@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Milestone 3: EPDC bring-up and the first update, a full-screen INIT (mode 0) clear to white, done the way
+//! EPDC bring-up and updates. Milestone 3: the first update, a full-screen INIT (mode 0) clear to white, done the way
 //! Amazon's mxc_epdc_fb does it at hardware init (epdc_init_settings + epdc_init_sequence + draw_mode0).
 //! Every static register is compared with the golden snapshot taken from the stock driver on 7 Nov 2026 before
 //! the rails are allowed up; a mismatch aborts with nothing driven.
@@ -174,43 +174,87 @@ fn install_panic_hook() {
     }));
 }
 
+/// A rectangle in panel-native coordinates (800 wide, 600 tall, origin top-left as the EPDC scans it).
+#[derive(Clone, Copy, Debug)]
+pub struct Rect { pub x: u32, pub y: u32, pub w: u32, pub h: u32 }
+
+impl Rect {
+    pub const FULL: Rect = Rect { x: 0, y: 0, w: XRES, h: YRES };
+    /// The EPDC v1 has no stride register: the update buffer is the region's pixels packed row by row, so the
+    /// stock driver sizes and positions every region in multiples of 8 pixels (its PxP output is 8x8 blocks,
+    /// `pxp_upd_region` in mxc_epdc_fb.c). Same rule here until a run shows the controller needs less.
+    pub fn check(&self) -> Result<(), String> {
+        if self.w == 0 || self.h == 0 { return Err(format!("{self:?}: empty")); }
+        if self.x + self.w > XRES || self.y + self.h > YRES { return Err(format!("{self:?}: outside the {XRES}x{YRES} panel")); }
+        if [self.x, self.y, self.w, self.h].iter().any(|v| v % 8 != 0) { return Err(format!("{self:?}: x, y, w, h must be multiples of 8")); }
+        Ok(())
+    }
+}
+
 /// Submit one update covering the whole panel from map3 and wait for its LUT. `fixed_np`: Some(v) uses the
 /// EPDC's fixed-next-pixel test mode (the stock INIT update uses Some(0)); None uses the buffer's pixels.
 /// Returns true if the LUT completed within the timeout.
 pub fn update_full(pn: &Panel, wfm_mode: u32, fixed_np: Option<u8>, timeout_ms: u64) -> bool {
+    update_rect(pn, pn.m_upd.phys as u32, Rect::FULL, wfm_mode, true, fixed_np, timeout_ms).is_some()
+}
+
+/// Submit one update of `rect` from the packed region buffer at physical address `buf_phys` (rect.w bytes per
+/// row, rect.h rows) and wait for its LUT. `full`: UPDATE_MODE_FULL drives every pixel in the rectangle;
+/// otherwise the EPDC compares against the working buffer and drives only the pixels that change (PARTIAL).
+/// Returns the time the LUT took, or None if it was still active at the timeout.
+pub fn update_rect(pn: &Panel, buf_phys: u32, rect: Rect, wfm_mode: u32, full: bool, fixed_np: Option<u8>, timeout_ms: u64) -> Option<std::time::Duration> {
     let r = &pn.r;
+    if let Err(e) = rect.check() { eprintln!("refusing update: {e}"); return None; }
     let lut = {
         let nl = r.read32(regs::STATUS_NEXTLUT);
-        if nl & regs::STATUS_NEXTLUT_NEXT_LUT_VALID == 0 { eprintln!("no LUT available (STATUS_NEXTLUT {:#x})", nl); return false; }
+        if nl & regs::STATUS_NEXTLUT_NEXT_LUT_VALID == 0 { eprintln!("no LUT available (STATUS_NEXTLUT {:#x})", nl); return None; }
         nl & regs::STATUS_NEXTLUT_NEXT_LUT_MASK
     };
     r.write32(regs::IRQ_MASK_SET, regs::IRQ_WB_CMPLT | (1 << lut));
-    r.write32(regs::UPD_ADDR, pn.m_upd.phys as u32);
-    r.write32(regs::UPD_CORD, 0);
-    r.write32(regs::UPD_SIZE, (YRES << regs::UPD_SIZE_HEIGHT_OFFSET) | XRES);
+    r.write32(regs::UPD_ADDR, buf_phys);
+    r.write32(regs::UPD_CORD, (rect.y << regs::UPD_CORD_YCORD_OFFSET) | rect.x);
+    r.write32(regs::UPD_SIZE, (rect.h << regs::UPD_SIZE_HEIGHT_OFFSET) | rect.w);
     r.write32(regs::TEMP, pn.tidx);
-    let mut ctrl = (lut << regs::UPD_CTRL_LUT_SEL_OFFSET) | (wfm_mode << regs::UPD_CTRL_WAVEFORM_MODE_OFFSET) | regs::UPD_CTRL_UPDATE_MODE_FULL;
+    let mut ctrl = (lut << regs::UPD_CTRL_LUT_SEL_OFFSET) | (wfm_mode << regs::UPD_CTRL_WAVEFORM_MODE_OFFSET);
+    if full { ctrl |= regs::UPD_CTRL_UPDATE_MODE_FULL; }
     match fixed_np {
         Some(v) => { r.write32(regs::UPD_FIXED, regs::UPD_FIXED_FIXNP_EN | ((v as u32) << 8)); ctrl |= regs::UPD_CTRL_USE_FIXED; }
         None => r.write32(regs::UPD_FIXED, 0),
     }
-    println!("update: LUT {} mode {} fixed_np {:?} -> UPD_CTRL {:#010x}", lut, wfm_mode, fixed_np, ctrl);
+    println!("update: {:?} buf {:#010x} LUT {} mode {} {} fixed_np {:?} -> UPD_CTRL {:#010x}",
+        rect, buf_phys, lut, wfm_mode, if full { "FULL" } else { "PARTIAL" }, fixed_np, ctrl);
     let t0 = std::time::Instant::now();
     r.write32(regs::UPD_CTRL, ctrl);
     let mut done = false;
-    let mut i = 0u64;
+    let mut next_report = 0u128;
     while t0.elapsed().as_millis() < timeout_ms as u128 {
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(2));
         let luts = r.read32(regs::STATUS_LUTS);
-        if i % 10 == 0 { println!("  t+{:>5} ms STATUS_LUTS {:#06x} IRQ {:#010x} STATUS {:#x} COL {:#x}", t0.elapsed().as_millis(), luts, r.read32(regs::IRQ), r.read32(regs::STATUS), r.read32(regs::STATUS_COL)); }
+        let ms = t0.elapsed().as_millis();
+        if ms >= next_report { println!("  t+{:>5} ms STATUS_LUTS {:#06x} IRQ {:#010x} STATUS {:#x} COL {:#x}", ms, luts, r.read32(regs::IRQ), r.read32(regs::STATUS), r.read32(regs::STATUS_COL)); next_report = ms + 250; }
         if luts & (1 << lut) == 0 { done = true; break; }
-        i += 1;
     }
-    println!("LUT {} {} after {:?}; IRQ {:#010x}", lut, if done { "complete" } else { "STILL ACTIVE" }, t0.elapsed(), r.read32(regs::IRQ));
+    let took = t0.elapsed();
+    println!("LUT {} {} after {:?}; IRQ {:#010x} COL {:#x}", lut, if done { "complete" } else { "STILL ACTIVE" }, took, r.read32(regs::IRQ), r.read32(regs::STATUS_COL));
     r.write32(regs::IRQ_CLEAR, regs::IRQ_WB_CMPLT | regs::IRQ_LUT_COL | (1 << lut));
     r.write32(regs::IRQ_MASK_CLEAR, regs::IRQ_WB_CMPLT | (1 << lut));
-    if !done { std::thread::sleep(std::time::Duration::from_millis(500)); }
-    done
+    if !done { std::thread::sleep(std::time::Duration::from_millis(500)); return None; }
+    Some(took)
+}
+
+/// Taking the panel over from an unknown state (whatever the stock driver last drew): the stock INIT, then a
+/// full-screen GC16 to white. The INIT clears the panel but leaves the working buffer at the fixed next pixel,
+/// 0 (black), as the stock driver does at boot; stock follows it with a FULL GC16 of the splash, which rewrites
+/// every working-buffer pixel. Without that second step, DU's black-to-black entry and PARTIAL mode's
+/// unchanged-pixel skip both leave glyphs undriven on a white panel (8 Nov 2026, first m5 run). The white
+/// buffer is the first XRES*YRES bytes of map3, which bring_up fills with 0xff.
+pub const WHITE_END: usize = ((XRES * YRES) as usize + 4095) & !4095;
+pub fn take_over(pn: &Panel) {
+    println!("== INIT (unknown panel state)");
+    update_full(pn, regs::WFM_INIT, Some(0), 6000);
+    println!("== GC16 full-screen white (working buffer to white)");
+    pn.m_upd.fill(0, (XRES * YRES) as usize, 0xff);
+    update_full(pn, regs::WFM_GC16, None, 8000);
 }
 
 /// `epdc white [--check] [wbf]`: bring up, then (unless --check) rails up, the stock INIT update, rails down.
@@ -226,9 +270,9 @@ pub fn white(check_only: bool, wf_path: Option<&str>) {
     pmic::rails_down(&pn.p);
 }
 
-/// Load a binary PGM (P5, 8-bit) of exactly XRES×YRES into the update buffer. 0 = black, 255 = white (the EPDC
-/// uses the top four bits of each byte in P4N format, the same Y8 buffer the stock driver's PXP produces).
-pub fn load_pgm(path: &str, m_upd: &uio::Map) -> Result<(), String> {
+/// Read a binary PGM (P5, maxval 255): (width, height, pixels). 0 = black, 255 = white; the EPDC uses the top
+/// four bits of each byte in P4N format, the same Y8 layout the stock driver's PxP produces.
+pub fn read_pgm(path: &str) -> Result<(u32, u32, Vec<u8>), String> {
     let d = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
     let mut fields = Vec::new();
     let mut i = 0;
@@ -240,15 +284,22 @@ pub fn load_pgm(path: &str, m_upd: &uio::Map) -> Result<(), String> {
         fields.push(String::from_utf8_lossy(&d[s..i]).to_string());
     }
     i += 1; // the single whitespace after maxval
-    if fields.len() < 4 || fields[0] != "P5" { return Err("not a binary PGM (P5)".into()); }
+    if fields.len() < 4 || fields[0] != "P5" { return Err(format!("{path}: not a binary PGM (P5)")); }
     let (w, h, maxv): (u32, u32, u32) = (fields[1].parse().map_err(|_| "bad width")?, fields[2].parse().map_err(|_| "bad height")?, fields[3].parse().map_err(|_| "bad maxval")?);
-    if w != XRES || h != YRES || maxv != 255 { return Err(format!("need {XRES}x{YRES} maxval 255, got {w}x{h} maxval {maxv}")); }
+    if maxv != 255 { return Err(format!("{path}: need maxval 255, got {maxv}")); }
     let n = (w * h) as usize;
-    if d.len() < i + n { return Err("PGM truncated".into()); }
-    m_upd.copy_in(0, &d[i..i + n]);
-    let back = m_upd.read_bytes(0, 8);
-    println!("image {}: {}x{}, first bytes {:02x?} (dma {:02x?})", path, w, h, &d[i..i + 8], back);
-    if back != d[i..i + 8] { return Err("DMA copy mismatch".into()); }
+    if d.len() < i + n { return Err(format!("{path}: PGM truncated")); }
+    Ok((w, h, d[i..i + n].to_vec()))
+}
+
+/// Copy `px` into the update map at `off` and read the head back (DMA sanity).
+fn load_into(m_upd: &uio::Map, off: usize, px: &[u8], what: &str) -> Result<(), String> {
+    if off + px.len() > m_upd.len { return Err(format!("{what}: {} bytes at {off:#x} do not fit the update map ({:#x})", px.len(), m_upd.len)); }
+    m_upd.copy_in(off, px);
+    let n = px.len().min(8);
+    let back = m_upd.read_bytes(off, n);
+    println!("{what}: {} bytes at map3+{off:#x}, first bytes {:02x?} (dma {:02x?})", px.len(), &px[..n], back);
+    if back != px[..n] { return Err("DMA copy mismatch".into()); }
     Ok(())
 }
 
@@ -256,20 +307,77 @@ pub fn load_pgm(path: &str, m_upd: &uio::Map) -> Result<(), String> {
 /// waveform mode (default GC16 = 2), rails down. The first real pixels from userspace.
 pub fn show(image: &str, mode: u32, wf_path: Option<&str>, init_first: bool) {
     let pn = bring_up(wf_path);
-    if let Err(e) = load_pgm(image, &pn.m_upd) { eprintln!("{e}"); std::process::exit(10); }
+    let (w, h, px) = match read_pgm(image) { Ok(v) => v, Err(e) => { eprintln!("{e}"); std::process::exit(10); } };
+    if w != XRES || h != YRES { eprintln!("{image}: need {XRES}x{YRES}, got {w}x{h}"); std::process::exit(10); }
     install_panic_hook();
     println!("== rails up");
     if let Err(e) = pmic::rails_up(&pn.p) { eprintln!("rails: {e}"); std::process::exit(9); }
-    if init_first {
-        // We take the panel over from an unknown state (whatever the stock driver last drew) with a zeroed
-        // working buffer. A GC16 straight away drives every pixel from the wrong "old" value and the previous
-        // image ghosts through (seen 7 Nov 2026 with the splash). The stock driver's first update at boot is an
-        // INIT for the same reason: clear to a known state, then draw.
-        println!("== INIT first (unknown panel state)");
-        update_full(&pn, regs::WFM_INIT, Some(0), 6000);
-    }
+    // A GC16 straight onto an unknown panel drives every pixel from the wrong "old" value and the previous
+    // image ghosts through (seen 7 Nov 2026 with the splash); see take_over.
+    if init_first { take_over(&pn); }
+    if let Err(e) = load_into(&pn.m_upd, 0, &px, image) { eprintln!("{e}"); pmic::rails_down(&pn.p); std::process::exit(10); }
     println!("== full-screen update, waveform mode {}", mode);
     update_full(&pn, mode, None, 8000);
     println!("== rails down");
     pmic::rails_down(&pn.p);
+}
+
+/// One step of `epdc blit`: a PGM whose size is the rectangle, placed at (x, y) in panel coordinates.
+#[derive(Clone, Debug)]
+pub struct BlitOp { pub pgm: String, pub x: u32, pub y: u32, pub mode: Option<u32>, pub full: bool }
+
+/// What the stock driver's WAVEFORM_MODE_AUTO does with the PxP histogram of the region: only black and white
+/// present -> the two-level DU; any other grey -> GL16 (the framework's page-turn choice; GC16 is the periodic
+/// full flash). Antialiased text through DU comes out ragged (8 Nov 2026), so the choice matters per region.
+pub fn auto_mode(px: &[u8]) -> (u32, usize) {
+    let mut seen = [false; 16];
+    for &p in px { seen[(p >> 4) as usize] = true; }
+    let levels = seen.iter().filter(|&&b| b).count();
+    let bw_only = seen.iter().enumerate().all(|(i, &b)| !b || i == 0 || i == 15);
+    (if bw_only { regs::WFM_DU } else { regs::WFM_GL16 }, levels)
+}
+
+/// `epdc blit [--no-init] [--wbf path] <pgm>@<x>,<y>[:<mode>|:auto][:full|partial] ...`: bring up, rails up,
+/// take over (unless --no-init), then each rectangle update in turn, from a region-sized buffer at the next 4 KiB slot
+/// of map3, timing each LUT. Milestone 5: partial updates, the thing a text display is built from.
+pub fn blit(ops: &[BlitOp], wf_path: Option<&str>, init_first: bool) {
+    // Validate everything before the panel is touched: every PGM readable, every rectangle legal.
+    let mut loaded = Vec::new();
+    for op in ops {
+        let (w, h, px) = match read_pgm(&op.pgm) { Ok(v) => v, Err(e) => { eprintln!("{e}"); std::process::exit(10); } };
+        let rect = Rect { x: op.x, y: op.y, w, h };
+        if let Err(e) = rect.check() { eprintln!("{}: {e}", op.pgm); std::process::exit(10); }
+        loaded.push((rect, px));
+    }
+    let pn = bring_up(wf_path);
+    install_panic_hook();
+    println!("== rails up");
+    if let Err(e) = pmic::rails_up(&pn.p) { eprintln!("rails: {e}"); std::process::exit(9); }
+    if init_first { take_over(&pn); }
+    let mut results = Vec::new();
+    // Region buffers go in successive 4 KiB-aligned slots after the full-screen white buffer, wrapping when the
+    // map is used up: a buffer is never rewritten right after its update, even though update_rect waits for
+    // each LUT before returning.
+    let mut next_off = WHITE_END;
+    for (op, (rect, px)) in ops.iter().zip(&loaded) {
+        if next_off + px.len() > pn.m_upd.len { next_off = WHITE_END; }
+        let off = next_off;
+        next_off += (px.len() + 4095) & !4095;
+        if let Err(e) = load_into(&pn.m_upd, off, px, &op.pgm) { eprintln!("{e}"); break; }
+        let mode = match op.mode {
+            Some(m) => m,
+            None => { let (m, levels) = auto_mode(px); println!("auto: {} grey levels in the region -> waveform mode {}", levels, m); m }
+        };
+        println!("== blit {} -> {:?} mode {} {}", op.pgm, rect, mode, if op.full { "FULL" } else { "PARTIAL" });
+        let took = update_rect(&pn, pn.m_upd.phys as u32 + off as u32, *rect, mode, op.full, None, 8000);
+        results.push((op.clone(), *rect, mode, took));
+        if took.is_none() { eprintln!("update did not complete; stopping the sequence"); break; }
+    }
+    println!("== rails down");
+    pmic::rails_down(&pn.p);
+    println!("== summary");
+    for (op, rect, mode, took) in &results {
+        println!("  {:<40} {:>3},{:>3} {:>3}x{:>3} mode {}{} {:<7} {}", op.pgm, rect.x, rect.y, rect.w, rect.h, mode, if op.mode.is_none() { " (auto)" } else { "" },
+            if op.full { "FULL" } else { "PARTIAL" }, took.map(|d| format!("{} ms", d.as_millis())).unwrap_or("TIMEOUT".into()));
+    }
 }

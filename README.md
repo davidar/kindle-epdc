@@ -21,8 +21,8 @@ with its source; [docs/kernel-tree.md](docs/kernel-tree.md) explains how the shi
 | 3 | Controller init matching the stock driver register for register; full-screen INIT update (screen to white) | done |
 | 3.5 | `.wbf` to `.wrf` waveform converter, byte-identical to Amazon's tool, every checksum verified | done |
 | 4 | An image: 8-bit PGM through a full-screen GC16 update, greys and orientation correct, INIT first | done |
-| 5 | Partial updates: a rectangle rather than the whole screen (region-sized buffer, 8-pixel alignment, panel coordinates), with the DU mode as the fast monochrome path; what a text display builds on | next |
-| 6 | Concurrent updates: LUT collision handling and resubmission, fresh temperature conversions | |
+| 5 | Partial updates: a rectangle rather than the whole screen (region-sized buffer, 8-pixel alignment, panel coordinates); waveform chosen per region from its histogram as the stock driver does (DU for black and white, GL16 for greys) | done |
+| 6 | Concurrent updates: LUT collision handling and resubmission, fresh temperature conversions | next |
 | 7 | Unattended operation: idle power and clock gating behind the clock-state invariant, suspend coordination | |
 
 ## Why
@@ -49,8 +49,9 @@ metal, and the out-of-tree i.MX6 EPDC DRM driver.
   sequence; `wbf.rs` the `.wbf` → `.wrf` waveform converter, with tests; `display.rs` controller init, the golden
   check and updates; `main.rs` the command line.
 - `scripts/`: `hold.sh` and `release.sh` keep the Kindle from suspending during a session; `m1-probe.sh`,
-  `m2-rails.sh`, `m3-init-white.sh` are the milestone runs, each of which swaps the stock driver out, runs one
-  step, and restores stock through the boot job.
+  `m2-rails.sh`, `m3-init-white.sh`, `m4-image.sh`, `m5-blit.sh` are the milestone runs, each of which swaps the
+  stock driver out, runs one step, and restores stock through the boot job. `render-text.py` renders a line of
+  text as a region PGM in panel orientation for `epdc blit`.
 - `epdc-regs-stock.bin`: the EPDC register window as Amazon's driver leaves it, the reference every init is
   compared against.
 
@@ -66,11 +67,21 @@ epdc pmic [dump|up [ms|stay]|down]   Papyrus registers; rails up (and down again
 epdc wbf <in.wbf> [out.wrf]     convert a waveform and print its header
 epdc white [--check] [wbf]      controller init + golden check (+ one full-screen INIT update unless --check)
 epdc show <image.pgm> [mode] [wbf] [--no-init]   draw an 800x600 8-bit PGM with one full-screen update
-                                (mode: 0 INIT, 1 DU, 2 GC16, 4 A2, 5 GL16); an INIT comes first unless --no-init
+                                (mode: 0 INIT, 1 DU, 2 GC16, 4 A2, 5 GL16)
+epdc blit [--no-init] [--wbf path] <pgm>@<x>,<y>[:<mode>|:auto][:full|partial] ...
+                                rectangle updates in sequence, each PGM's size the rectangle, placed at (x, y) in
+                                panel coordinates (all multiples of 8); mode defaults to auto; each LUT is timed
 ```
 
 Everything but `wbf` needs the shim loaded. `white` refuses to power the panel unless the parsed waveform matches a
 cached `.wrf` beside it (when one exists) and every static register matches the golden snapshot.
+
+Taking the panel over (`show` and `blit`, unless `--no-init`) is the stock INIT followed by a full-screen GC16 to
+white. The INIT alone leaves the working buffer at black while the panel is white, and the next partial or DU
+update then skips every glyph pixel as unchanged. The region buffer has no stride: a rectangle's pixels are packed
+row by row, as the stock driver's PxP output is. `auto` counts the grey levels in the region and picks DU when
+only black and white are present and GL16 otherwise, the stock driver's histogram rule; antialiased text through
+DU comes out ragged.
 
 ## Building
 

@@ -12,6 +12,13 @@
  * It also turns on the two EPDC clocks and the EPDC pin mux, which on this 2.6.31 kernel can only be done
  * from kernel code. No EPDC register is touched here. Everything that knows what the EPDC is lives in userspace.
  *
+ * Clock gating (milestone 7): userspace writes 0 to the `clocks` attribute when the panel is idle and 1 before
+ * the next update, as the stock driver's epdc_powerdown/epdc_powerup do around its clk_disable/clk_enable. A bus
+ * access to the register window with the clocks off stalls the AXI bus and wedges the CPU, so the shim owns the
+ * mmap of map0: pages are installed from a fault handler that refuses (SIGBUS) while the clocks are off, and
+ * gating first tears every installed page down. A stale mapping in userspace therefore kills that process, not
+ * the device. Suspend is refused while the clocks are on.
+ *
  * Build: see ../README.md (external module against the ~/git/kindle-touch-kernel build tree).
  * Load:  /sbin/rmmod mxc_epdc_fb && /sbin/insmod /mnt/us/kindle-epdc/epdc_uio.ko
  */
@@ -22,6 +29,9 @@
 #include <linux/dma-mapping.h>
 #include <linux/clk.h>
 #include <linux/io.h>
+#include <linux/mm.h>
+#include <linux/fs.h>
+#include <linux/sched.h>
 
 #define NBUF 3
 static unsigned int dma_size = 2 << 20;
@@ -39,17 +49,96 @@ struct epdc_uio {
 	size_t dma_len[NBUF];
 	int irq_enabled;
 	int clocks_on;
+	struct mutex lock;			/* clocks_on transitions and the mapping teardown */
+	struct address_space *mapping;		/* /dev/uioN's, to zap map0 pages when gating */
 };
+
+static void epdc_uio_clocks_set(struct epdc_uio *p, int on)
+{
+	mutex_lock(&p->lock);
+	if (on && !p->clocks_on) {
+		gpio_epdc_pins_enable(1);
+		clk_enable(p->clk_axi);
+		clk_enable(p->clk_pix);
+		p->clocks_on = 1;
+	} else if (!on && p->clocks_on) {
+		p->clocks_on = 0;
+		/* Tear down every installed page of map0 (file offset 0, one page) before the bus clock goes:
+		 * the next access faults into epdc_uio_regs_fault, which refuses while clocks_on is 0. */
+		if (p->mapping)
+			unmap_mapping_range(p->mapping, 0, PAGE_SIZE, 1);
+		clk_disable(p->clk_pix);
+		clk_disable(p->clk_axi);
+		gpio_epdc_pins_enable(0);
+	}
+	mutex_unlock(&p->lock);
+}
 
 /* /sys/bus/platform/devices/mxc_epdc_fb/clocks (also reachable as /sys/class/uio/uioN/device/clocks):
  * "1" while the shim holds epdc_axi+epdc_pix enabled. Userspace must refuse to touch map0 unless this reads 1:
- * a register access with the clocks gated stalls the AXI bus and wedges the CPU (7 Nov 2026 21:00). */
+ * a register access with the clocks gated stalls the AXI bus and wedges the CPU (7 Nov 2026 21:00). Writable:
+ * "0" gates (after zapping any mapping of map0), "1" ungates. Userspace sets CTRL.CLKGATE itself before gating
+ * and clears it after ungating, as the stock driver does around clk_disable/clk_enable. */
 static ssize_t clocks_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct epdc_uio *p = platform_get_drvdata(to_platform_device(dev));
 	return sprintf(buf, "%d\n", p ? p->clocks_on : 0);
 }
-static DEVICE_ATTR(clocks, 0444, clocks_show, NULL);
+static ssize_t clocks_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t n)
+{
+	struct epdc_uio *p = platform_get_drvdata(to_platform_device(dev));
+	if (!p || n < 1 || (buf[0] != '0' && buf[0] != '1'))
+		return -EINVAL;
+	epdc_uio_clocks_set(p, buf[0] == '1');
+	return n;
+}
+static DEVICE_ATTR(clocks, 0644, clocks_show, clocks_store);
+
+/* map0 is installed page by page from this fault handler so that gating can tear it down and a later access
+ * fails loudly. Maps 1..3 (DMA buffers) keep UIO's own physical mapping behaviour, replicated here because an
+ * info->mmap callback replaces it for every map. */
+static int epdc_uio_regs_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+{
+	struct epdc_uio *p = vma->vm_private_data;
+	unsigned long pfn = p->info.mem[0].addr >> PAGE_SHIFT;
+	int ret;
+	if (vmf->pgoff != 0)
+		return VM_FAULT_SIGBUS;
+	mutex_lock(&p->lock);
+	if (!p->clocks_on) {
+		mutex_unlock(&p->lock);
+		printk(KERN_WARNING "epdc_uio: register access with the clocks gated; SIGBUS to pid %d (%s)\n",
+		       current->pid, current->comm);
+		return VM_FAULT_SIGBUS;
+	}
+	ret = vm_insert_pfn(vma, (unsigned long)vmf->virtual_address, pfn);
+	mutex_unlock(&p->lock);
+	if (ret == -EBUSY)	/* raced with another thread installing the same page */
+		return VM_FAULT_NOPAGE;
+	return ret ? VM_FAULT_SIGBUS : VM_FAULT_NOPAGE;
+}
+static struct vm_operations_struct epdc_uio_regs_vm_ops = { .fault = epdc_uio_regs_fault };
+
+static int epdc_uio_mmap(struct uio_info *info, struct vm_area_struct *vma)
+{
+	struct epdc_uio *p = info->priv;
+	int mi = vma->vm_pgoff;		/* UIO: map index = offset in pages */
+	unsigned long len = vma->vm_end - vma->vm_start;
+	if (mi < 0 || mi > NBUF || len > PAGE_ALIGN(info->mem[mi].size))
+		return -EINVAL;
+	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+	if (mi == 0) {
+		if (len != PAGE_SIZE)
+			return -EINVAL;
+		vma->vm_flags |= VM_IO | VM_RESERVED | VM_PFNMAP | VM_DONTEXPAND;
+		vma->vm_ops = &epdc_uio_regs_vm_ops;
+		vma->vm_private_data = p;
+		p->mapping = vma->vm_file->f_mapping;
+		return 0;	/* pages come from the fault handler */
+	}
+	vma->vm_flags |= VM_IO | VM_RESERVED;
+	return remap_pfn_range(vma, vma->vm_start, info->mem[mi].addr >> PAGE_SHIFT, len, vma->vm_page_prot);
+}
 
 /* Papyrus control pins, as the board file wires them (arch/arm/mach-mx5/mx50_pins.h, IOMUX_TO_GPIO = port*32+bit):
  * GPIO2_27 PWRCOM = VCOM enable (out), GPIO2_28 PWRSTAT = power good (in), GPIO2_29 PWRCTRL0 = wakeup (out).
@@ -142,6 +231,7 @@ static int __devinit epdc_uio_probe(struct platform_device *pdev)
 		}
 	}
 
+	mutex_init(&p->lock);
 	clk_enable(p->clk_axi);
 	clk_enable(p->clk_pix);
 	clk_set_rate(p->clk_pix, 32000000); /* E60_V220_WJ pixclock, as the stock init_hw sets it */
@@ -149,7 +239,7 @@ static int __devinit epdc_uio_probe(struct platform_device *pdev)
 	gpio_epdc_pins_enable(1);
 
 	p->info.name = "epdc";
-	p->info.version = "0.1";
+	p->info.version = "0.2";
 	p->info.priv = p;
 	p->info.mem[0].name = "regs";
 	p->info.mem[0].addr = regs->start;
@@ -168,6 +258,7 @@ static int __devinit epdc_uio_probe(struct platform_device *pdev)
 	p->info.irq_flags = 0;
 	p->info.handler = epdc_uio_handler;
 	p->info.irqcontrol = epdc_uio_irqcontrol;
+	p->info.mmap = epdc_uio_mmap;
 	p->irq_enabled = 1;
 
 	ret = uio_register_device(&pdev->dev, &p->info);
@@ -188,10 +279,7 @@ static int __devinit epdc_uio_probe(struct platform_device *pdev)
 	return 0;
 
 err_dma:
-	p->clocks_on = 0;
-	gpio_epdc_pins_enable(0);
-	clk_disable(p->clk_pix);
-	clk_disable(p->clk_axi);
+	epdc_uio_clocks_set(p, 0);
 err_dma_partial:
 	{
 		int b;
@@ -214,10 +302,7 @@ static int __devexit epdc_uio_remove(struct platform_device *pdev)
 	device_remove_file(&pdev->dev, &dev_attr_vcom);
 	device_remove_file(&pdev->dev, &dev_attr_clocks);
 	uio_unregister_device(&p->info);
-	p->clocks_on = 0;
-	gpio_epdc_pins_enable(0);
-	clk_disable(p->clk_pix);
-	clk_disable(p->clk_axi);
+	epdc_uio_clocks_set(p, 0);	/* balanced: a no-op if userspace already gated */
 	clk_put(p->clk_pix);
 	clk_put(p->clk_axi);
 	{
@@ -229,10 +314,30 @@ static int __devexit epdc_uio_remove(struct platform_device *pdev)
 	return 0;
 }
 
+/* System suspend while the clocks are on would freeze a userspace driver mid-session with a live register
+ * mapping and the rails possibly up; the stock driver blanks and powers down in its suspend hook instead. Here
+ * userspace is expected to have gated already (its idle path); if it has not, the suspend is refused and the
+ * system stays up. */
+static int epdc_uio_suspend(struct platform_device *pdev, pm_message_t state)
+{
+	struct epdc_uio *p = platform_get_drvdata(pdev);
+	if (p && p->clocks_on) {
+		dev_warn(&pdev->dev, "epdc_uio: refusing suspend, EPDC clocks are on (userspace has not gated)\n");
+		return -EBUSY;
+	}
+	return 0;
+}
+static int epdc_uio_resume(struct platform_device *pdev)
+{
+	return 0;	/* clocks stay gated until userspace asks for them */
+}
+
 static struct platform_driver epdc_uio_driver = {
 	.driver = { .name = "mxc_epdc_fb", .owner = THIS_MODULE },
 	.probe = epdc_uio_probe,
 	.remove = __devexit_p(epdc_uio_remove),
+	.suspend = epdc_uio_suspend,
+	.resume = epdc_uio_resume,
 };
 
 static int __init epdc_uio_init(void)

@@ -11,19 +11,29 @@ It is a test harness so far, not a display server; drawing text or anything else
 driver's is to put a buffer of pixels on a region of the panel with a chosen waveform. [docs/hardware.md](docs/hardware.md) has every hardware fact
 with its source; [docs/kernel-tree.md](docs/kernel-tree.md) explains how the shim is built against the stock kernel.
 
-## Milestones
+## What it does
 
-| # | What | State |
-|---|---|---|
-| 0 | Recon: Rust runs on the 2.6.31 kernel; who holds the framebuffer; I2C, UIO and waveform files located | done |
-| 1 | Shim loads in place of the stock module; registers read from userspace; golden register snapshot taken | done |
-| 2 | Papyrus PMIC read over I2C; display rails up and down from userspace through the chip's sequencer | done |
-| 3 | Controller init matching the stock driver register for register; full-screen INIT update (screen to white) | done |
-| 3.5 | `.wbf` to `.wrf` waveform converter, byte-identical to Amazon's tool, every checksum verified | done |
-| 4 | An image: 8-bit PGM through a full-screen GC16 update, greys and orientation correct, INIT first | done |
-| 5 | Partial updates: a rectangle rather than the whole screen (region-sized buffer, 8-pixel alignment, panel coordinates); waveform chosen per region from its histogram as the stock driver does (DU for black and white, GL16 for greys) | done |
-| 6 | Concurrent updates: submit as soon as the working buffer is free, one LUT per update, collisions held and resubmitted, a fresh PMIC temperature conversion per run | done |
-| 7 | Unattended operation: idle power and clock gating behind the clock-state invariant, suspend coordination | next |
+- Takes the EPDC over from the stock driver at runtime: a UIO shim replaces `mxc_epdc_fb`, the Rust driver
+  programs the controller register for register as the stock init does, and every static register is checked
+  against a snapshot of the stock driver before the panel is powered.
+- Powers the panel through the Papyrus PMIC over I2C, with the chip's own sequencer and power-good polling; the
+  rails come down on every exit path.
+- Converts the panel's own `.wbf` waveform to the controller's format, byte-identical to Amazon's tool, and
+  picks the temperature range from a fresh PMIC conversion.
+- Draws: full-screen updates from an 8-bit PGM, and rectangle updates from packed region buffers in panel
+  coordinates, with the waveform chosen per region from its histogram as the stock driver does (DU for black and
+  white, GL16 for greys).
+- Overlaps updates in time: one LUT per update, submitted as soon as the working buffer is free; collisions
+  are held and resubmitted. Words typed 150 ms apart each land 250 ms after their own submit.
+- Idles the way stock does: rails off, clocks gated, with the register access that once hung the CPU turned
+  into a SIGBUS for the offending process by the shim. System suspend is refused while the clocks are on and
+  survived while gated.
+
+What it is not yet: a display anyone can use. It is one process per sequence rather than a daemon owning the
+panel; completion is polled rather than taken from the UIO interrupt; text rendering lives in a host script;
+there is no periodic full refresh against ghosting; one panel and one temperature band have been tested; and
+the shim has only been built against Amazon's kernel, so the kernel independence it was built for is argued,
+not shown.
 
 ## Why
 
@@ -42,14 +52,16 @@ metal, and the out-of-tree i.MX6 EPDC DRM driver.
 
 - `shim/`: `epdc_uio.c`, the kernel side. Binds to the `mxc_epdc_fb` platform device once the stock module is
   unloaded, enables the EPDC clocks, allocates three 2 MiB coherent buffers, and exposes registers, buffers and the
-  interrupt through UIO, plus the Papyrus control pins and the clock state through sysfs. `build.sh` builds it
-  against the stock kernel tree ([docs/kernel-tree.md](docs/kernel-tree.md)). GPL-2.0.
+  interrupt through UIO, plus the Papyrus control pins and the clock state through sysfs. It owns the mmap of
+  the register window so that gating the clocks tears the mapping down and any later access faults with SIGBUS.
+  `build.sh` builds it against the stock kernel tree ([docs/kernel-tree.md](docs/kernel-tree.md)). GPL-2.0.
 - `epdc/`: the driver (GPL-2.0-only). `uio.rs` UIO client whose only way to map the register window checks the
   shim's clock state; `regs.rs` the EPDC register map; `pmic.rs` the Papyrus over `/dev/i2c/1` and the rails
   sequence; `wbf.rs` the `.wbf` → `.wrf` waveform converter, with tests; `display.rs` controller init, the golden
   check and updates; `main.rs` the command line.
 - `scripts/`: `hold.sh` and `release.sh` keep the Kindle from suspending during a session; `m1-probe.sh`,
-  `m2-rails.sh`, `m3-init-white.sh`, `m4-image.sh`, `m5-blit.sh`, `m6-pipeline.sh` are the milestone runs, each
+  `m2-rails.sh`, `m3-init-white.sh`, `m4-image.sh`, `m5-blit.sh`, `m6-pipeline.sh`, `m7-idle.sh`, `m7b-suspend.sh`
+  are the milestone runs, each
   of which swaps the stock driver out, runs one step, and restores stock through the boot job. `render-text.py`
   renders a line of text as a region PGM in panel orientation for `epdc blit`, whole or one word per file.
 - `epdc-regs-stock.bin`: the EPDC register window as Amazon's driver leaves it, the reference every init is
@@ -72,6 +84,12 @@ epdc blit [--no-init] [--serial] [--wbf path] <pgm>@<x>,<y>[:<mode>|:auto][:full
                                 rectangle updates, each PGM's size the rectangle, placed at (x, y) in panel
                                 coordinates (all multiples of 8); mode defaults to auto; +<ms> waits after the
                                 previous submit. Pipelined unless --serial; every LUT is timed
+epdc idle-cycle [n] [--gap ms]  take over, then n times: draw a strip, idle (rails down, clocks gated), wait,
+                                wake, verify the registers survived
+epdc gate-test                  prove the guard: gate the clocks behind a live register map and touch it
+                                (the process dies with SIGBUS; rails never powered)
+epdc suspend-test [--alarm s]   take over, draw; request suspend with the clocks on (refused); idle, arm the
+                                PMIC RTC alarm, suspend for real, wake the panel, draw again. Run detached
 ```
 
 Everything but `wbf` needs the shim loaded. `white` refuses to power the panel unless the parsed waveform matches a
@@ -92,6 +110,22 @@ as a collision (not applied), held until those LUTs finish, and resubmitted. A c
 until it clears. Measured: four strips submitted within 35 ms finish together in one GL16 time (612 ms) instead
 of 1.7 s serial; words submitted every 150 ms each finish 250 to 260 ms after their own submit. Temperature is a
 fresh PMIC conversion at bring-up and again when the last one is over 30 s old (stock reconverts every 60 s).
+
+Idle is the stock power-down: rails off, `CTRL.CLKGATE`, then the shim's `clocks` attribute written to 0, which
+disables both clocks and the pin mux. Before it gates, the shim zaps every page of the register window mapped
+into userspace, and its fault handler refuses to map one back while the clocks are off, so the access that
+hung the CPU on the first night now kills the offending process with SIGBUS and a kernel log line. In the driver
+the idle panel is a separate type with no register map at all. Wake is the reverse, followed by a check that
+the static registers and buffer addresses survived (they do; stock relies on it too). Measured: idle 24 ms,
+wake 24 ms including power-good.
+
+System suspend: the shim's suspend hook returns `-EBUSY` while the clocks are on, so a suspend attempted under a
+live driver fails ("Device mxc_epdc_fb failed to suspend: error -16") and the system stays up; the stock driver
+instead blanks and powers down in its hook. With the driver idle (clocks gated) suspend goes through; on resume
+the clocks stay gated until the driver asks for them, and `wake` then found every register kept and drew. In the
+run that proved this (`epdc suspend-test`, `scripts/m7b-suspend.sh`) the device woke after 0.9 s rather than on
+the 30 s RTC alarm, most likely because the USB accessory is an enabled wake source, so this exercised the
+coordination, not a long sleep.
 
 ## Building
 
@@ -131,7 +165,8 @@ wifi. The device must be jailbroken for ssh; nothing else is changed on it.
 ## Safety rules, all enforced in code or script
 
 - EPDC registers are touched only through the shim, which turns the clocks on first; a register access with the
-  clocks gated stalls the bus and hangs the CPU (learned the hard way; now impossible by construction).
+  clocks gated stalls the bus and hangs the CPU (learned the hard way). The driver refuses to map the registers
+  while the clocks are off, and the shim makes a stale mapping fault instead of reaching the bus.
 - Writes into the DMA buffers are aligned 32-bit stores; UIO maps them strongly-ordered and `memcpy` faults.
 - The waveform is the panel's own, parsed and checksum-verified, and compared with the stock conversion.
 - Every static register is compared with the stock driver's values before the rails come up.

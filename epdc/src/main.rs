@@ -46,8 +46,21 @@ fn main() {
                 if a.starts_with("--") { continue; }
                 match parse_blit(a) { Some(op) => ops.push(op), None => { eprintln!("bad blit op {a:?}: want <pgm>@<x>,<y>[:<mode>|:auto][:full|partial][+<ms>]"); std::process::exit(2); } }
             }
-            if ops.is_empty() { eprintln!("usage: epdc blit [--no-init] [--serial] [--wbf path] <pgm>@<x>,<y>[:<mode>|:auto][:full|partial][+<ms>] ..."); std::process::exit(2); }
+            if ops.is_empty() { eprintln!("usage: epdc blit [--no-init] [--serial] [--wbf path] <pgm>@<x>,<y>[:<mode>|:auto][:full|partial][+<ms>] ... | idle-cycle [n] [--gap ms] | gate-test | suspend-test [--alarm s]"); std::process::exit(2); }
             display::blit(&ops, wbf, !no_init, serial)
+        }
+        Some("idle-cycle") => {
+            // epdc idle-cycle [n] [--gap ms] [--wbf path]
+            let gap: u64 = args.iter().position(|a| a == "--gap").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(3000);
+            let wbf = args.iter().position(|a| a == "--wbf").and_then(|i| args.get(i + 1)).map(String::as_str);
+            let n: u32 = args.get(2).filter(|a| !a.starts_with("--")).and_then(|v| v.parse().ok()).unwrap_or(5);
+            display::idle_cycle(n, gap, wbf)
+        }
+        Some("gate-test") => display::gate_test(),
+        Some("suspend-test") => {
+            let alarm: u64 = args.iter().position(|a| a == "--alarm").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(30);
+            let wbf = args.iter().position(|a| a == "--wbf").and_then(|i| args.get(i + 1)).map(String::as_str);
+            display::suspend_test(alarm, wbf)
         }
         Some("pmic") => match args.get(2).map(String::as_str) {
             None | Some("dump") => pmic::dump(),

@@ -13,7 +13,7 @@ kernel `2.6.31-rt11-lab126`, board `imx50_yoshi`) or was read off the device. Fi
 | EPDC version register | `0x01000000` (v1.0.0, the i.MX50 revision; 16 LUTs) | read through the shim |
 | Register map | `drivers/video/mxc/epdc_regs.h` (v1; `epdc_regs_v2.h` is later silicon) | |
 | Clocks | `epdc_axi`, `epdc_pix` (pixel clock set to 32 MHz) | `drivers/video/mxc/mxc_epdc_fb.c` |
-| Clock gating | the stock driver disables both clocks and sets `CTRL.CLKGATE` whenever the display powers down; a bus access to the gated block hangs the CPU | `epdc_powerdown()` |
+| Clock gating | the stock driver disables both clocks and sets `CTRL.CLKGATE` whenever the display powers down; a bus access to the gated block hangs the CPU. Registers keep their values across gating: `epdc_powerup()` does not re-init, and six gate/ungate cycles here left every static register and both buffer addresses unchanged (8 Nov 2026) | `epdc_powerdown()`, `epdc_powerup()` |
 | Pin mux | `gpio_epdc_pins_enable(1)` (SDCE0, GDSP); PWRCOM is muxed to the EPDC (ALT0) | `arch/arm/mach-mx5/mx50_yoshi_gpio.c` |
 
 ## Panel and timing

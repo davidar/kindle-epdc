@@ -38,6 +38,12 @@ impl Uio {
         Err(io::Error::new(io::ErrorKind::NotFound, format!("no uio device named {name}")))
     }
 
+    /// Ask the shim to gate (false) or ungate (true) the EPDC clocks. Gating with a register map still alive
+    /// is a bug; the shim zaps the pages so the next access gets SIGBUS instead of stalling the bus.
+    pub fn set_clocks(&self, on: bool) -> io::Result<()> {
+        std::fs::write(format!("/sys/class/uio/uio{}/device/clocks", self.index), if on { "1" } else { "0" })
+    }
+
     /// The shim's clock state: /sys/class/uio/uioN/device/clocks is "1" while epdc_axi + epdc_pix are enabled.
     /// A register access with the clocks gated stalls the bus and wedges the CPU, so every path to map0 goes
     /// through `map_regs`, which checks this first. There is deliberately no other way to map the registers.
@@ -88,6 +94,15 @@ impl Uio {
 
     pub fn irq_enable(&mut self, on: bool) -> io::Result<()> {
         self.file.write_all(&(on as u32).to_ne_bytes())
+    }
+}
+
+impl Drop for Map {
+    /// Unmap on drop, so a map that is no longer referenced cannot be reached by a stale pointer. The register
+    /// map in particular must be gone before the clocks are gated (display::Panel::idle drops it first; the
+    /// shim also tears the pages down and faults any later access with SIGBUS).
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.len); }
     }
 }
 

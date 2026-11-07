@@ -203,6 +203,9 @@ pub fn up(hold_ms: Option<&str>) {
 }
 
 pub fn down() {
+    // The backstop runs after anything, including an idle driver that left the clocks gated: ungate first,
+    // then insist on the shim being there like every other command.
+    if let Ok(u) = crate::uio::Uio::open_by_name("epdc") { if !u.clocks_on() { let _ = u.set_clocks(true); } }
     require_shim();
     let p = Pmic::open().expect("open /dev/i2c/1");
     down_inner(&p);
@@ -210,6 +213,8 @@ pub fn down() {
 
 fn down_inner(p: &Pmic) {
     if let Ok(u) = crate::uio::Uio::open_by_name("epdc") {
+        // The backstop must work from any state, including clocks gated by an idle driver that died.
+        if !u.clocks_on() { let _ = u.set_clocks(true); println!("clocks were gated; ungated for the power-down"); }
         if let Ok(r) = u.map_regs() {
             r.write32(crate::regs::GPIO, r.read32(crate::regs::GPIO) & !crate::regs::GPIO_PWRCOM);
             println!("EPDC_GPIO = {:#010x}", r.read32(crate::regs::GPIO));

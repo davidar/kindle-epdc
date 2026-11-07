@@ -505,3 +505,151 @@ pub fn blit(ops: &[BlitOp], wf_path: Option<&str>, init_first: bool, serial: boo
             if res.collisions > 0 { format!("  {} collision(s)", res.collisions) } else { String::new() });
     }
 }
+
+/// The panel at idle: rails down, CTRL.CLKGATE set, register map gone, EPDC clocks gated by the shim. There is
+/// no register map in here, so nothing can reach the EPDC until `wake` brings the clocks back and maps it again
+/// (the type system's version of the shim's clocks check). The working buffer and the waveform stay in DRAM;
+/// registers keep their values across gating, as the stock driver assumes (epdc_powerup does not re-init).
+pub struct IdlePanel {
+    u: uio::Uio, m_wf: uio::Map, m_wb: uio::Map, m_upd: uio::Map, p: pmic::Pmic,
+    trt: Vec<u8>, tidx: u32, temp_at: std::time::Instant, wv_addr: u32, wb_addr: u32,
+}
+
+impl Panel {
+    /// Stock epdc_powerdown, split between us and the shim: wait for the controller to go quiet, rails down
+    /// (PWRCOM off, ENABLE to standby, PG_GOOD 0, then CTRL.CLKGATE), drop the register map, gate the clocks.
+    pub fn idle(self) -> IdlePanel {
+        let t0 = std::time::Instant::now();
+        while (self.r.read32(regs::STATUS_LUTS) != 0 || self.r.read32(regs::STATUS) & regs::STATUS_WB_BUSY != 0) && t0.elapsed().as_secs() < 10 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let wv_addr = self.r.read32(regs::WVADDR);
+        let wb_addr = self.r.read32(regs::WB_ADDR);
+        pmic::rails_down(&self.p);
+        let Panel { u, r, m_wf, m_wb, m_upd, p, trt, tidx, temp_at } = self;
+        drop(r);
+        if let Err(e) = u.set_clocks(false) { eprintln!("gating clocks: {e}"); }
+        println!("idle: clocks {} after {:?}", if u.clocks_on() { "STILL ON" } else { "gated" }, t0.elapsed());
+        IdlePanel { u, m_wf, m_wb, m_upd, p, trt, tidx: tidx.get(), temp_at: temp_at.get(), wv_addr, wb_addr }
+    }
+}
+
+impl IdlePanel {
+    /// Stock epdc_powerup: clocks on, CTRL.CLKGATE cleared, rails up. Then the check stock does not do: the
+    /// static registers must still equal the golden snapshot and the buffer addresses what we left; if not,
+    /// the controller lost state across gating and is re-initialised (no INIT: the working buffer is intact).
+    pub fn wake(self) -> Panel {
+        let t0 = std::time::Instant::now();
+        let IdlePanel { u, m_wf, m_wb, m_upd, p, trt, tidx, temp_at, wv_addr, wb_addr } = self;
+        if let Err(e) = u.set_clocks(true) { eprintln!("ungating clocks: {e}"); std::process::exit(11); }
+        let r = match u.map_regs() { Ok(r) => r, Err(e) => { eprintln!("wake: {e}"); std::process::exit(11); } };
+        r.write32(regs::CTRL_CLEAR, regs::CTRL_CLKGATE);
+        let t1 = std::time::Instant::now();
+        while r.read32(regs::CTRL) & regs::CTRL_CLKGATE != 0 && t1.elapsed().as_millis() < 100 {}
+        let kept = r.read32(regs::WVADDR) == wv_addr && r.read32(regs::WB_ADDR) == wb_addr && GOLDEN.iter().all(|(_, off, want)| r.read32(*off) == *want);
+        if !kept {
+            println!("wake: registers did not survive gating (WVADDR {:#010x} WB_ADDR {:#010x}); re-initialising", r.read32(regs::WVADDR), r.read32(regs::WB_ADDR));
+            init_settings(&r, tidx);
+            r.write32(regs::WVADDR, wv_addr);
+            r.write32(regs::WB_ADDR, wb_addr);
+            if !check_golden(&r) { eprintln!("golden mismatch after re-init; refusing to power the panel"); std::process::exit(8); }
+        }
+        if let Err(e) = pmic::rails_up(&p) { eprintln!("wake: rails: {e}"); std::process::exit(9); }
+        println!("wake: clocks on, CTRL {:#010x}, registers {}, rails up; {:?}", r.read32(regs::CTRL), if kept { "kept" } else { "RE-INITIALISED" }, t0.elapsed());
+        Panel { u, r, m_wf, m_wb, m_upd, p, trt, tidx: std::cell::Cell::new(tidx), temp_at: std::cell::Cell::new(temp_at) }
+    }
+}
+
+/// `epdc idle-cycle [n] [--gap ms] [--wbf path]`: take the panel over, then n times: draw a DU strip, go idle
+/// (rails down, clocks gated), wait, wake, verify. Milestone 7's unattended-operation loop; each strip appearing
+/// on the panel after a wake shows the controller and working buffer came through the gating intact.
+pub fn idle_cycle(n: u32, gap_ms: u64, wf_path: Option<&str>) {
+    let pn = bring_up(wf_path);
+    install_panic_hook();
+    println!("== rails up");
+    if let Err(e) = pmic::rails_up(&pn.p) { eprintln!("rails: {e}"); std::process::exit(9); }
+    take_over(&pn);
+    let mut pn = pn;
+    let mut log: Vec<(u32, std::time::Duration, std::time::Duration, bool)> = Vec::new();
+    for i in 0..n {
+        // A 48x600 strip of alternating 16x16 black and white blocks, shifted by cycle, at portrait row 16+56*i.
+        let row = 16 + 56 * i;
+        if row + 48 > XRES { break; }
+        let rect = Rect { x: XRES - row - 48, y: 0, w: 48, h: YRES };
+        let px: Vec<u8> = (0..rect.w * rect.h).map(|k| { let (x, y) = (k % rect.w, k / rect.w); if ((x / 16) + (y / 16) + i) % 2 == 0 { 0x00 } else { 0xff } }).collect();
+        if let Err(e) = load_into(&pn.m_upd, WHITE_END, &px, &format!("cycle {i} strip")) { eprintln!("{e}"); break; }
+        let drawn = update_rect(&pn, pn.m_upd.phys as u32 + WHITE_END as u32, rect, regs::WFM_DU, true, None, 4000).is_some();
+        let ti = std::time::Instant::now();
+        let idle = pn.idle();
+        let t_idle = ti.elapsed();
+        println!("== idle for {} ms (clocks attr {})", gap_ms, if idle.u.clocks_on() { "1" } else { "0" });
+        std::thread::sleep(std::time::Duration::from_millis(gap_ms));
+        let tw = std::time::Instant::now();
+        pn = idle.wake();
+        log.push((i, t_idle, tw.elapsed(), drawn));
+    }
+    println!("== rails down");
+    pmic::rails_down(&pn.p);
+    println!("== summary");
+    for (i, t_idle, t_wake, drawn) in &log { println!("  cycle {}: strip {}, idle took {:?}, wake took {:?}", i, if *drawn { "drawn" } else { "FAILED" }, t_idle, t_wake); }
+}
+
+/// `epdc gate-test`: prove the shim's guard. Map the registers, gate the clocks behind the map's back, then
+/// read a register. Correct outcome: this process dies with SIGBUS (exit 135 from a shell) and the kernel log
+/// says why; the wrong outcome, a hung CPU, is what the guard exists to prevent. Rails are never powered.
+pub fn gate_test() {
+    pmic::require_shim();
+    let u = uio::Uio::open_by_name("epdc").expect("uio epdc");
+    let r = u.map_regs().expect("regs");
+    println!("VERSION {:#010x} with clocks on", r.read32(regs::VERSION));
+    r.write32(regs::CTRL_SET, regs::CTRL_CLKGATE);
+    u.set_clocks(false).expect("gate");
+    println!("clocks attr now {}; touching the stale map (expect SIGBUS)...", if u.clocks_on() { "1" } else { "0" });
+    let v = r.read32(regs::VERSION);
+    println!("STILL ALIVE: read {:#010x} through a gated map; the guard did not fire", v);
+    u.set_clocks(true).expect("ungate");
+    std::process::exit(12);
+}
+
+/// `epdc suspend-test [--alarm s]`: the suspend half of milestone 7. Take over, draw a strip; with the clocks
+/// on, ask for system suspend and expect the shim to refuse it (EBUSY); go idle (clocks gated), arm the PMIC
+/// RTC alarm, suspend for real (the write blocks until resume), then wake the panel, verify or re-init the
+/// registers, and draw a second strip. Run detached: the USB link drops across the suspend. The suspend guard
+/// (bind mount over /sys/power/state) must be lifted by the caller for the duration.
+pub fn suspend_test(alarm_s: u64, wf_path: Option<&str>) {
+    let pn = bring_up(wf_path);
+    install_panic_hook();
+    println!("== rails up");
+    if let Err(e) = pmic::rails_up(&pn.p) { eprintln!("rails: {e}"); std::process::exit(9); }
+    take_over(&pn);
+    let strip = |pn: &Panel, i: u32| {
+        let row = 16 + 56 * i;
+        let rect = Rect { x: XRES - row - 48, y: 0, w: 48, h: YRES };
+        let px: Vec<u8> = (0..rect.w * rect.h).map(|k| { let (x, y) = (k % rect.w, k / rect.w); if ((x / 16) + (y / 16) + i) % 2 == 0 { 0x00 } else { 0xff } }).collect();
+        load_into(&pn.m_upd, WHITE_END, &px, &format!("strip {i}")).map_err(|e| eprintln!("{e}")).ok();
+        update_rect(pn, pn.m_upd.phys as u32 + WHITE_END as u32, rect, regs::WFM_DU, true, None, 4000).is_some()
+    };
+    println!("== strip 0 {}", if strip(&pn, 0) { "drawn" } else { "FAILED" });
+    println!("== A. suspend request with the clocks on (expect the shim to refuse)");
+    match std::fs::write("/sys/power/state", "mem") {
+        Ok(()) => println!("A: UNEXPECTED: the system suspended and resumed with the clocks on"),
+        Err(e) => println!("A: suspend refused: {e} (clocks attr {})", if pn.u.clocks_on() { 1 } else { 0 }),
+    }
+    println!("== B. idle, then a real suspend with an RTC alarm in {} s", alarm_s);
+    let idle = pn.idle();
+    let rtc = ["/sys/class/rtc/rtc1", "/sys/class/rtc/rtc0"].iter().find(|d| std::path::Path::new(&format!("{d}/wakealarm")).exists()).copied();
+    let Some(rtc) = rtc else { eprintln!("no RTC with a wakealarm; not suspending"); let pn = idle.wake(); pmic::rails_down(&pn.p); std::process::exit(13); };
+    let now: u64 = std::fs::read_to_string(format!("{rtc}/since_epoch")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    // 2.6.31's wakealarm takes an absolute time on the RTC's own clock (which counts from 1970 on this device).
+    if let Err(e) = std::fs::write(format!("{rtc}/wakealarm"), format!("{}", now + alarm_s)) { eprintln!("wakealarm: {e}"); }
+    println!("B: {} since_epoch {} -> alarm {}; clocks attr {}; suspending", rtc, now, now + alarm_s, if idle.u.clocks_on() { 1 } else { 0 });
+    let t0 = std::time::Instant::now();
+    match std::fs::write("/sys/power/state", "mem") {
+        Ok(()) => println!("B: resumed after {:?} (wall clock in the write); clocks attr {}", t0.elapsed(), if idle.u.clocks_on() { 1 } else { 0 }),
+        Err(e) => println!("B: suspend write failed: {e}"),
+    }
+    let pn = idle.wake();
+    println!("== strip 1 after resume {}", if strip(&pn, 1) { "drawn" } else { "FAILED" });
+    let idle = pn.idle();
+    println!("suspend-test done; clocks attr {}", if idle.u.clocks_on() { 1 } else { 0 });
+}

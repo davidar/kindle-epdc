@@ -1,0 +1,20 @@
+# the panel's waveform is E Ink's licensed data, read from this one Kindle: never in a repo
+panel/
+# build output and device logs
+epdc/target/
+scripts/oneoff/rust-probe/target/
+shim/*.o
+shim/*.ko
+shim/*.mod.c
+shim/*.mod.o
+shim/.*.cmd
+shim/.tmp_versions/
+shim/Module.symvers
+shim/modules.order
+logs/
+
+# local-only: one-off recon passes and installer tied to one particular Kindle setup
+private/
+
+# my working notes, not for the repo
+CLAUDE.local.md

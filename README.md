@@ -7,8 +7,23 @@ kernel; the same code should run on a mainline kernel with a device-tree node in
 Status (7 November 2026): the driver initialises the controller exactly as Amazon's driver does, parses the panel's
 own waveform from the `.wbf` in the panel's flash, powers the display through the Papyrus PMIC's sequencer, and
 draws images: a full-screen GC16 update of an 8-bit PGM, text and a grey ramp rendered correctly on a real panel.
-It is a test harness so far, not a display server. [docs/hardware.md](docs/hardware.md) has every hardware fact
+It is a test harness so far, not a display server; drawing text or anything else is the application's job, the
+driver's is to put a buffer of pixels on a region of the panel with a chosen waveform. [docs/hardware.md](docs/hardware.md) has every hardware fact
 with its source; [docs/kernel-tree.md](docs/kernel-tree.md) explains how the shim is built against the stock kernel.
+
+## Milestones
+
+| # | What | State |
+|---|---|---|
+| 0 | Recon: Rust runs on the 2.6.31 kernel; who holds the framebuffer; I2C, UIO and waveform files located | done |
+| 1 | Shim loads in place of the stock module; registers read from userspace; golden register snapshot taken | done |
+| 2 | Papyrus PMIC read over I2C; display rails up and down from userspace through the chip's sequencer | done |
+| 3 | Controller init matching the stock driver register for register; full-screen INIT update (screen to white) | done |
+| 3.5 | `.wbf` to `.wrf` waveform converter, byte-identical to Amazon's tool, every checksum verified | done |
+| 4 | An image: 8-bit PGM through a full-screen GC16 update, greys and orientation correct, INIT first | done |
+| 5 | Partial updates: a rectangle rather than the whole screen (region-sized buffer, 8-pixel alignment, panel coordinates), with the DU mode as the fast monochrome path; what a text display builds on | next |
+| 6 | Concurrent updates: LUT collision handling and resubmission, fresh temperature conversions | |
+| 7 | Unattended operation: idle power and clock gating behind the clock-state invariant, suspend coordination | |
 
 ## Why
 

@@ -123,6 +123,8 @@ pub struct Panel {
     pub trt: Vec<u8>,
     pub tidx: std::cell::Cell<u32>,
     pub temp_at: std::cell::Cell<std::time::Instant>,
+    /// Interrupts taken so far (for the run summaries: proof the waits are event-driven, not polled).
+    pub irq_events: std::cell::Cell<u32>,
 }
 
 /// How long a temperature conversion stays good for; the stock papyrus driver refreshes every 60 s.
@@ -139,6 +141,41 @@ impl Panel {
             self.temp_at.set(std::time::Instant::now());
         }
         self.tidx.get()
+    }
+}
+
+/// The EPDC interrupt sources unmasked while the panel is up: every LUT's completion and the TCE underrun the
+/// stock driver always leaves unmasked. WB_CMPLT and LUT_COL are unmasked only while `submit` waits for them:
+/// left unmasked and pending they hold the line high, and the first interrupt-driven run (8 Nov 2026) took
+/// 17,803 interrupts for one INIT because of exactly that.
+pub const IRQ_ARMED: u32 = regs::IRQ_LUT_MASK | regs::IRQ_TCE_UNDERRUN;
+pub const IRQ_WB: u32 = regs::IRQ_WB_CMPLT | regs::IRQ_LUT_COL;
+
+impl Panel {
+    /// Unmask the interrupt sources above at the EPDC. The golden snapshot has IRQ_MASK = TCE_UNDERRUN only
+    /// (the stock driver's idle state), so this runs after `check_golden`, and `idle` puts the stock value back.
+    pub fn irq_arm(&self) {
+        self.r.write32(regs::IRQ_CLEAR, IRQ_ARMED | IRQ_WB);
+        self.r.write32(regs::IRQ_MASK, IRQ_ARMED);
+        let _ = self.u.irq_enable(true);
+    }
+    pub fn irq_disarm(&self) {
+        self.r.write32(regs::IRQ_MASK, regs::IRQ_TCE_UNDERRUN);
+        self.r.write32(regs::IRQ_CLEAR, IRQ_ARMED | IRQ_WB);
+    }
+    /// Sleep until the EPDC raises an interrupt or `timeout_ms` passes. Returns the IRQ register as it stood;
+    /// 0 on timeout. LUT-completion and underrun bits are acknowledged here (callers read completion from
+    /// STATUS_LUTS, a level, so nothing is lost). WB_CMPLT and LUT_COL are left for `submit`, the only waiter
+    /// for them, which unmasks them for the wait: STATUS_COL is only valid while LUT_COL is pending (clearing
+    /// it first read the mask as 0 on 8 Nov 2026), so submit reads the colliding LUTs and then clears both.
+    pub fn irq_wait(&self, timeout_ms: u64) -> u32 {
+        let fired = self.u.wait_irq_timeout(timeout_ms.min(i32::MAX as u64) as i32).unwrap_or(None).is_some();
+        let irq = self.r.read32(regs::IRQ);
+        let ack = irq & (regs::IRQ_LUT_MASK | regs::IRQ_TCE_UNDERRUN);
+        if ack != 0 { self.r.write32(regs::IRQ_CLEAR, ack); }
+        if irq & regs::IRQ_TCE_UNDERRUN != 0 { eprintln!("TCE UNDERRUN (IRQ {:#010x})", irq); }
+        if fired { self.irq_events.set(self.irq_events.get() + 1); let _ = self.u.irq_enable(true); }
+        irq
     }
 }
 
@@ -181,7 +218,9 @@ pub fn bring_up(wf_path: Option<&str>) -> Panel {
     println!("WVADDR {:#010x} WB_ADDR {:#010x} TEMP {} CTRL {:#010x}", r.read32(regs::WVADDR), r.read32(regs::WB_ADDR), r.read32(regs::TEMP), r.read32(regs::CTRL));
     println!("== golden check");
     if !check_golden(&r) { eprintln!("register mismatch against the stock snapshot: refusing to power the panel"); std::process::exit(8); }
-    Panel { u, r, m_wf, m_wb, m_upd, p, trt: wf.trt.clone(), tidx: std::cell::Cell::new(tidx), temp_at: std::cell::Cell::new(std::time::Instant::now()) }
+    let pn = Panel { u, r, m_wf, m_wb, m_upd, p, trt: wf.trt.clone(), tidx: std::cell::Cell::new(tidx), temp_at: std::cell::Cell::new(std::time::Instant::now()), irq_events: std::cell::Cell::new(0) };
+    pn.irq_arm();
+    pn
 }
 
 fn install_panic_hook() {
@@ -229,7 +268,6 @@ pub fn update_rect(pn: &Panel, buf_phys: u32, rect: Rect, wfm_mode: u32, full: b
         if nl & regs::STATUS_NEXTLUT_NEXT_LUT_VALID == 0 { eprintln!("no LUT available (STATUS_NEXTLUT {:#x})", nl); return None; }
         nl & regs::STATUS_NEXTLUT_NEXT_LUT_MASK
     };
-    r.write32(regs::IRQ_MASK_SET, regs::IRQ_WB_CMPLT | (1 << lut));
     r.write32(regs::UPD_ADDR, buf_phys);
     r.write32(regs::UPD_CORD, (rect.y << regs::UPD_CORD_YCORD_OFFSET) | rect.x);
     r.write32(regs::UPD_SIZE, (rect.h << regs::UPD_SIZE_HEIGHT_OFFSET) | rect.w);
@@ -245,18 +283,20 @@ pub fn update_rect(pn: &Panel, buf_phys: u32, rect: Rect, wfm_mode: u32, full: b
     let t0 = std::time::Instant::now();
     r.write32(regs::UPD_CTRL, ctrl);
     let mut done = false;
-    let mut next_report = 0u128;
+    let mut next_report = 250u128;
+    let ev0 = pn.irq_events.get();
     while t0.elapsed().as_millis() < timeout_ms as u128 {
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        let ms = t0.elapsed().as_millis();
+        // Sleep on the interrupt; wake at the latest for the periodic status line.
+        pn.irq_wait((next_report.saturating_sub(ms)).max(1) as u64);
         let luts = r.read32(regs::STATUS_LUTS);
         let ms = t0.elapsed().as_millis();
-        if ms >= next_report { println!("  t+{:>5} ms STATUS_LUTS {:#06x} IRQ {:#010x} STATUS {:#x} COL {:#x}", ms, luts, r.read32(regs::IRQ), r.read32(regs::STATUS), r.read32(regs::STATUS_COL)); next_report = ms + 250; }
+        if ms >= next_report { println!("  t+{:>5} ms STATUS_LUTS {:#06x} STATUS {:#x} COL {:#x}", ms, luts, r.read32(regs::STATUS), r.read32(regs::STATUS_COL)); next_report = ms + 250; }
         if luts & (1 << lut) == 0 { done = true; break; }
     }
     let took = t0.elapsed();
-    println!("LUT {} {} after {:?}; IRQ {:#010x} COL {:#x}", lut, if done { "complete" } else { "STILL ACTIVE" }, took, r.read32(regs::IRQ), r.read32(regs::STATUS_COL));
-    r.write32(regs::IRQ_CLEAR, regs::IRQ_WB_CMPLT | regs::IRQ_LUT_COL | (1 << lut));
-    r.write32(regs::IRQ_MASK_CLEAR, regs::IRQ_WB_CMPLT | (1 << lut));
+    println!("LUT {} {} after {:?}; {} irq(s); COL {:#x}", lut, if done { "complete" } else { "STILL ACTIVE" }, took, pn.irq_events.get() - ev0, r.read32(regs::STATUS_COL));
+    r.write32(regs::IRQ_CLEAR, IRQ_WB);
     if !done { std::thread::sleep(std::time::Duration::from_millis(500)); return None; }
     Some(took)
 }
@@ -353,13 +393,14 @@ pub fn submit(pn: &Panel, buf_phys: u32, rect: Rect, wfm_mode: u32, full: bool) 
         let nl = r.read32(regs::STATUS_NEXTLUT);
         if nl & regs::STATUS_NEXTLUT_NEXT_LUT_VALID != 0 { break nl & regs::STATUS_NEXTLUT_NEXT_LUT_MASK; }
         if t0.elapsed().as_millis() > 3000 { return Err(Err(format!("no LUT free after 3 s (STATUS_LUTS {:#06x})", r.read32(regs::STATUS_LUTS)))); }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        pn.irq_wait(100); // a LUT completing is an interrupt
     };
     while r.read32(regs::STATUS) & regs::STATUS_WB_BUSY != 0 {
         if t0.elapsed().as_millis() > 3000 { return Err(Err("working buffer busy for 3 s".into())); }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        pn.irq_wait(100);
     }
-    r.write32(regs::IRQ_CLEAR, regs::IRQ_WB_CMPLT | regs::IRQ_LUT_COL);
+    r.write32(regs::IRQ_CLEAR, IRQ_WB);
+    r.write32(regs::IRQ_MASK_SET, IRQ_WB);
     r.write32(regs::UPD_ADDR, buf_phys);
     r.write32(regs::UPD_CORD, (rect.y << regs::UPD_CORD_YCORD_OFFSET) | rect.x);
     r.write32(regs::UPD_SIZE, (rect.h << regs::UPD_SIZE_HEIGHT_OFFSET) | rect.w);
@@ -370,11 +411,12 @@ pub fn submit(pn: &Panel, buf_phys: u32, rect: Rect, wfm_mode: u32, full: bool) 
     r.write32(regs::UPD_CTRL, ctrl);
     let t1 = std::time::Instant::now();
     loop {
-        let irq = r.read32(regs::IRQ);
+        let irq = pn.irq_wait(1000);
         if irq & regs::IRQ_WB_CMPLT != 0 {
-            let col = r.read32(regs::STATUS_COL);
+            let col = r.read32(regs::STATUS_COL); // valid while LUT_COL is pending: read before the ack
             let collided = irq & regs::IRQ_LUT_COL != 0;
-            r.write32(regs::IRQ_CLEAR, regs::IRQ_WB_CMPLT | regs::IRQ_LUT_COL);
+            r.write32(regs::IRQ_CLEAR, IRQ_WB);
+            r.write32(regs::IRQ_MASK_CLEAR, IRQ_WB);
             let luts = r.read32(regs::STATUS_LUTS);
             println!("  submit {:?} mode {} {} -> LUT {}: WB done in {:?}{}; STATUS_LUTS {:#06x}", rect, wfm_mode,
                 if full { "FULL" } else { "PARTIAL" }, lut, t1.elapsed(),
@@ -382,8 +424,7 @@ pub fn submit(pn: &Panel, buf_phys: u32, rect: Rect, wfm_mode: u32, full: bool) 
             if collided { return Err(Ok(col)); }
             return Ok(lut);
         }
-        if t1.elapsed().as_millis() > 1000 { return Err(Err(format!("no WB_CMPLT after 1 s (IRQ {:#010x} STATUS {:#x})", irq, r.read32(regs::STATUS)))); }
-        std::thread::sleep(std::time::Duration::from_micros(200));
+        if t1.elapsed().as_millis() > 1000 { r.write32(regs::IRQ_MASK_CLEAR, IRQ_WB); return Err(Err(format!("no WB_CMPLT after 1 s (STATUS {:#x})", r.read32(regs::STATUS)))); }
     }
 }
 
@@ -411,7 +452,10 @@ pub fn run_ops(pn: &Panel, ops: &[BlitOp], loaded: &[(Rect, Vec<u8>, usize)]) ->
     for (i, (op, (rect, px, off))) in ops.iter().zip(loaded).enumerate() {
         let mode = match op.mode { Some(m) => m, None => auto_mode(px).0 };
         results.push(OpResult { mode, lut: None, submitted_ms: 0, done_ms: None, collisions: 0 });
-        while last_submit.elapsed().as_millis() < op.delay_ms as u128 { harvest(&mut active, &mut results); std::thread::sleep(std::time::Duration::from_millis(1)); }
+        while last_submit.elapsed().as_millis() < op.delay_ms as u128 {
+            harvest(&mut active, &mut results);
+            pn.irq_wait((op.delay_ms as u128).saturating_sub(last_submit.elapsed().as_millis()).max(1) as u64);
+        }
         loop {
             harvest(&mut active, &mut results);
             let t = std::time::Instant::now();
@@ -421,7 +465,7 @@ pub fn run_ops(pn: &Panel, ops: &[BlitOp], loaded: &[(Rect, Vec<u8>, usize)]) ->
                     results[i].collisions += 1;
                     if results[i].collisions > 8 { eprintln!("{}: still colliding after 8 tries, giving up", op.pgm); break; }
                     let tw = std::time::Instant::now();
-                    while r.read32(regs::STATUS_LUTS) & mask != 0 && tw.elapsed().as_millis() < 3000 { harvest(&mut active, &mut results); std::thread::sleep(std::time::Duration::from_millis(1)); }
+                    while r.read32(regs::STATUS_LUTS) & mask != 0 && tw.elapsed().as_millis() < 3000 { harvest(&mut active, &mut results); pn.irq_wait(100); }
                     println!("  colliding LUTs {:#06x} clear after {:?}; resubmitting {}", mask, tw.elapsed(), op.pgm);
                 }
                 Err(Err(e)) => { eprintln!("{}: {e}", op.pgm); break; }
@@ -429,9 +473,9 @@ pub fn run_ops(pn: &Panel, ops: &[BlitOp], loaded: &[(Rect, Vec<u8>, usize)]) ->
         }
     }
     let tw = std::time::Instant::now();
-    while !active.is_empty() && tw.elapsed().as_millis() < 10000 { harvest(&mut active, &mut results); std::thread::sleep(std::time::Duration::from_millis(1)); }
+    while !active.is_empty() && tw.elapsed().as_millis() < 10000 { harvest(&mut active, &mut results); pn.irq_wait(500); }
     for &(lut, i) in &active { eprintln!("LUT {} ({}) still active after 10 s", lut, ops[i].pgm); }
-    println!("batch complete at t+{} ms", ms(std::time::Instant::now()));
+    println!("batch complete at t+{} ms; {} interrupts taken for {} updates", ms(std::time::Instant::now()), pn.irq_events.get(), ops.len());
     results
 }
 
@@ -512,7 +556,7 @@ pub fn blit(ops: &[BlitOp], wf_path: Option<&str>, init_first: bool, serial: boo
 /// registers keep their values across gating, as the stock driver assumes (epdc_powerup does not re-init).
 pub struct IdlePanel {
     u: uio::Uio, m_wf: uio::Map, m_wb: uio::Map, m_upd: uio::Map, p: pmic::Pmic,
-    trt: Vec<u8>, tidx: u32, temp_at: std::time::Instant, wv_addr: u32, wb_addr: u32,
+    trt: Vec<u8>, tidx: u32, temp_at: std::time::Instant, wv_addr: u32, wb_addr: u32, irq_events: u32,
 }
 
 impl Panel {
@@ -521,16 +565,17 @@ impl Panel {
     pub fn idle(self) -> IdlePanel {
         let t0 = std::time::Instant::now();
         while (self.r.read32(regs::STATUS_LUTS) != 0 || self.r.read32(regs::STATUS) & regs::STATUS_WB_BUSY != 0) && t0.elapsed().as_secs() < 10 {
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            self.irq_wait(500);
         }
+        self.irq_disarm(); // back to the stock idle mask, which is also what `wake` compares against
         let wv_addr = self.r.read32(regs::WVADDR);
         let wb_addr = self.r.read32(regs::WB_ADDR);
         pmic::rails_down(&self.p);
-        let Panel { u, r, m_wf, m_wb, m_upd, p, trt, tidx, temp_at } = self;
+        let Panel { u, r, m_wf, m_wb, m_upd, p, trt, tidx, temp_at, irq_events } = self;
         drop(r);
         if let Err(e) = u.set_clocks(false) { eprintln!("gating clocks: {e}"); }
         println!("idle: clocks {} after {:?}", if u.clocks_on() { "STILL ON" } else { "gated" }, t0.elapsed());
-        IdlePanel { u, m_wf, m_wb, m_upd, p, trt, tidx: tidx.get(), temp_at: temp_at.get(), wv_addr, wb_addr }
+        IdlePanel { u, m_wf, m_wb, m_upd, p, trt, tidx: tidx.get(), temp_at: temp_at.get(), wv_addr, wb_addr, irq_events: irq_events.get() }
     }
 }
 
@@ -540,7 +585,7 @@ impl IdlePanel {
     /// the controller lost state across gating and is re-initialised (no INIT: the working buffer is intact).
     pub fn wake(self) -> Panel {
         let t0 = std::time::Instant::now();
-        let IdlePanel { u, m_wf, m_wb, m_upd, p, trt, tidx, temp_at, wv_addr, wb_addr } = self;
+        let IdlePanel { u, m_wf, m_wb, m_upd, p, trt, tidx, temp_at, wv_addr, wb_addr, irq_events } = self;
         if let Err(e) = u.set_clocks(true) { eprintln!("ungating clocks: {e}"); std::process::exit(11); }
         let r = match u.map_regs() { Ok(r) => r, Err(e) => { eprintln!("wake: {e}"); std::process::exit(11); } };
         r.write32(regs::CTRL_CLEAR, regs::CTRL_CLKGATE);
@@ -556,7 +601,9 @@ impl IdlePanel {
         }
         if let Err(e) = pmic::rails_up(&p) { eprintln!("wake: rails: {e}"); std::process::exit(9); }
         println!("wake: clocks on, CTRL {:#010x}, registers {}, rails up; {:?}", r.read32(regs::CTRL), if kept { "kept" } else { "RE-INITIALISED" }, t0.elapsed());
-        Panel { u, r, m_wf, m_wb, m_upd, p, trt, tidx: std::cell::Cell::new(tidx), temp_at: std::cell::Cell::new(temp_at) }
+        let pn = Panel { u, r, m_wf, m_wb, m_upd, p, trt, tidx: std::cell::Cell::new(tidx), temp_at: std::cell::Cell::new(temp_at), irq_events: std::cell::Cell::new(irq_events) };
+        pn.irq_arm();
+        pn
     }
 }
 

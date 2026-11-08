@@ -24,13 +24,14 @@ with its source; [docs/kernel-tree.md](docs/kernel-tree.md) explains how the shi
   coordinates, with the waveform chosen per region from its histogram as the stock driver does (DU for black and
   white, GL16 for greys).
 - Overlaps updates in time: one LUT per update, submitted as soon as the working buffer is free; collisions
-  are held and resubmitted. Words typed 150 ms apart each land 250 ms after their own submit.
+  are held and resubmitted. Words typed 150 ms apart each land 250 ms after their own submit. Every wait is on
+  the EPDC interrupt through UIO, not a poll: about three interrupts per update.
 - Idles the way stock does: rails off, clocks gated, with the register access that once hung the CPU turned
   into a SIGBUS for the offending process by the shim. System suspend is refused while the clocks are on and
   survived while gated.
 
 What it is not yet: a display anyone can use. It is one process per sequence rather than a daemon owning the
-panel; completion is polled rather than taken from the UIO interrupt; text rendering lives in a host script;
+panel; text rendering lives in a host script;
 there is no periodic full refresh against ghosting; one panel and one temperature band have been tested; and
 the shim has only been built against Amazon's kernel, so the kernel independence it was built for is argued,
 not shown.
@@ -101,6 +102,14 @@ update then skips every glyph pixel as unchanged. The region buffer has no strid
 row by row, as the stock driver's PxP output is. `auto` counts the grey levels in the region and picks DU when
 only black and white are present and GL16 otherwise, the stock driver's histogram rule; antialiased text through
 DU comes out ragged.
+
+Waiting is interrupt-driven. The shim's handler masks the EPDC line at the interrupt controller and wakes the
+reader of `/dev/uioN`; the driver sleeps in `poll()` on that descriptor, reads the EPDC's IRQ register,
+acknowledges what it handled and re-enables the line. LUT completions and the TCE underrun are unmasked while
+the panel is up; WB_CMPLT and LUT_COL only while a submit waits for them, because left unmasked and pending
+they hold the line high (the first attempt took 17,803 interrupts for one INIT). STATUS_COL is only valid while
+LUT_COL is pending, so the submitter reads it before acknowledging. A run of 19 pipelined updates takes 62
+interrupts; a single full-screen update takes one.
 
 Updates overlap in time. Each occupies one of the 16 LUTs for the length of its waveform and the timing
 controller drives every active LUT on every frame, so the only serial part is the working-buffer stage, where the

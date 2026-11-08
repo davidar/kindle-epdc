@@ -85,15 +85,22 @@ impl Uio {
         Ok(Map { ptr: ptr as *mut u8, len, phys })
     }
 
-    /// Block until the next interrupt; returns the running count.
-    pub fn wait_irq(&mut self) -> io::Result<u32> {
+    /// Wait up to `timeout_ms` for the next interrupt (poll on the UIO fd, then read the event count). Returns
+    /// Some(count) on an interrupt, None on timeout. The shim's handler has masked the line at the interrupt
+    /// controller by then; the caller services the EPDC's IRQ register and calls `irq_enable(true)`.
+    pub fn wait_irq_timeout(&self, timeout_ms: i32) -> io::Result<Option<u32>> {
+        let mut pfd = libc::pollfd { fd: self.file.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        let n = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if n < 0 { return Err(io::Error::last_os_error()); }
+        if n == 0 { return Ok(None); }
         let mut b = [0u8; 4];
-        self.file.read_exact(&mut b)?;
-        Ok(u32::from_ne_bytes(b))
+        (&self.file).read_exact(&mut b)?;
+        Ok(Some(u32::from_ne_bytes(b)))
     }
 
-    pub fn irq_enable(&mut self, on: bool) -> io::Result<()> {
-        self.file.write_all(&(on as u32).to_ne_bytes())
+    /// Re-enable (true) or mask (false) the EPDC interrupt line at the interrupt controller.
+    pub fn irq_enable(&self, on: bool) -> io::Result<()> {
+        (&self.file).write_all(&(on as u32).to_ne_bytes())
     }
 }
 
